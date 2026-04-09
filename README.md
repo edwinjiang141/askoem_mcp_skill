@@ -2,23 +2,34 @@
 
 AI Gateway 的 MCP Server 最小实现，面向 OEM 只读诊断场景。
 
-当前推荐主流程（MVP-技能化改造）：
+核心架构分两层：
 
-1. 识别问题意图与目标类型
-2. 调用 OEM REST API 取数
-3. 调用预定义 Skill 进行 SOP 组织与输出
-4. 返回结构化结果文本
+- **MCP Tool 层（数据层）**：负责认证、OEM 取数、服务自检
+- **AI Skill 层（智能层）**：由 LLM 读取 SKILL.md 文档 + OEM 数据，生成结构化诊断回答
+
+主流程：
+
+1. 用户提问，`run_skill` MCP tool 接收问题
+2. IntentParser（规则）提取目标名/时间范围/意图类型
+3. AlertRouter（规则 + LLM fallback）识别告警场景
+4. OEM REST API（只读）拉取 incidents/events/latestData/timeSeries
+5. SkillRouter（LLM）根据问题选择最匹配的 Skill
+6. SkillExecutor（LLM）按 SKILL.md 的 Workflow/Constraints 生成结构化诊断
+7. 返回 4 段格式回答：结论 / 证据 / SOP 建议 / 下一步
 
 ## 项目结构
 
-- `src/mcp_server.py`：MCP Server 入口（`oem_login`、`fetch_data_from_oem`、`health_check`、`ask_ops` 兼容）
-- `src/service.py`：数据层编排（问题识别、路由、OEM 取数）与兼容问答入口
-- `src/intent_parser.py`：意图识别、目标名抽取、目标类型识别
+- `src/mcp_server.py`：MCP Server 入口（`oem_login`、`fetch_data_from_oem`、`run_skill`、`health_check`）
+- `src/service.py`：数据层编排（问题识别、路由、OEM 取数）+ AI Skill 调用入口
+- `src/skill_engine.py`：AI Skill 引擎（SkillRegistry / SkillRouter / SkillExecutor，基于 LangChain + DeepSeek）
+- `src/intent_parser.py`：意图识别、目标名抽取、目标类型识别（规则）
+- `src/alert_router.py`：告警场景路由（规则优先 + LLM fallback）
 - `src/oem_client.py`：OEM REST 客户端（只读，含兼容降级逻辑）
 - `src/auth_session.py`：会话缓存（TTL 30 分钟）
-- `src/skill_engine.py`：Skill 输出渲染引擎（MVP 提供 CPU 告警 Skill）
+- `src/sop_engine.py`：静态 SOP 模板（供 SKILL.md 引用）
 - `config/metric_map.yaml`：OEM 接口配置、默认地址、意图映射
-- `skills/cpu_alert_mvp/`：CPU 告警场景 Skill（`SKILL.md` + assets/references/scripts）
+- `skills/cpu_alert_mvp/`：CPU 告警诊断 Skill（`SKILL.md` + assets/references/scripts）
+- `.env`：LLM 配置（DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL / DEEPSEEK_MODEL）
 
 ## 快速启动
 
@@ -40,7 +51,19 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2) 检查配置
+### 2) 配置 LLM（DeepSeek）
+
+复制 `.env.example` 为 `.env`，填入 DeepSeek API Key：
+
+```bash
+DEEPSEEK_API_KEY=sk-your-key-here
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_MODEL=deepseek-chat
+```
+
+AI Skill Engine 通过 `python-dotenv` 从项目根目录 `.env` 加载以上变量。若未配置，`run_skill` 工具会降级返回简单文本摘要。
+
+### 3) 检查 OEM 配置
 
 文件：`config/metric_map.yaml`
 
@@ -56,7 +79,7 @@ pip install -r requirements.txt
 - `https://host:port/em/api`
 - `https://host:port/em`（控制台入口，代码会自动拼接 REST 路径）
 
-### 3) MCP 启动说明
+### 4) MCP 启动说明
 
 该服务是 **stdio MCP server**，应由 VS Code/Cursor/Cline 的 MCP 客户端拉起。  
 不要在交互终端手工输入请求内容。
@@ -67,7 +90,7 @@ pip install -r requirements.txt
 python -m src.mcp_server
 ```
 
-### 4) 中心化部署（推荐，避免每个客户端部署源码）
+### 5) 中心化部署（推荐，避免每个客户端部署源码）
 
 为避免“每个客户端都安装一份 Python 源码”，可使用 MCP 的 `streamable-http` 方式做中心化部署：
 
@@ -95,7 +118,7 @@ AI_GATEWAY_MCP_MOUNT_PATH=/mcp          # 仅 sse 生效
 2. 运行 `python -m src.mcp_server_http` 暴露 MCP HTTP 服务。
 3. Cline/Cursor 客户端改为配置远程 MCP 地址，而不是本地 `command + args`。
 
-## MCP 工具（技能化改造阶段）
+## MCP 工具
 
 ### `oem_login`
 
@@ -111,6 +134,8 @@ AI_GATEWAY_MCP_MOUNT_PATH=/mcp          # 仅 sse 生效
 
 ### `fetch_data_from_oem`
 
+纯数据工具，返回 OEM 原始结构化数据，不做诊断推理。
+
 参数：
 
 - `question`（必填）
@@ -121,16 +146,32 @@ AI_GATEWAY_MCP_MOUNT_PATH=/mcp          # 仅 sse 生效
 
 - `ok`
 - `session_id`（成功时）
-- `intent`（识别结果）
-- `routing`（场景路由结果）
-- `data`（latestData/timeSeries/incidents/events）
+- `intent`（识别结果：intent_type / target_name / time_range / metric_keys）
+- `routing`（场景路由结果：scenario / classifier / confidence）
+- `data`（latestData / timeSeries / incidents / events）
 
-### `ask_ops`（兼容入口）
+### `run_skill`
 
-说明：
+AI 诊断统一入口。内部先调用 `fetch_data` 获取 OEM 数据，再通过 AI Skill Engine（LLM）生成结构化诊断。
 
-- 保留用于兼容旧客户端调用。
-- 新流程中，`ask_ops` 内部先走 `fetch_data` 数据层，再按场景调用 Skill 渲染（当前已接入 CPU 告警 Skill）。
+参数：
+
+- `question`（必填）
+- `session_id`（推荐）
+- 或 `oem_base_url + username + password`
+
+返回：
+
+- `ok`
+- `session_id`（成功时）
+- `skill_name`（命中的 Skill 名称，未命中时为 null）
+- `result`（LLM 生成的结构化诊断文本，固定 4 段：结论 / 证据 / SOP 建议 / 下一步）
+
+降级行为：若 DEEPSEEK_API_KEY 未配置或 LLM 调用失败，返回简单文本摘要。
+
+### `health_check`
+
+调试与巡检工具，返回服务状态和已加载的工具列表。
 
 ## 当前支持的通用查询示例
 
@@ -140,66 +181,93 @@ AI_GATEWAY_MCP_MOUNT_PATH=/mcp          # 仅 sse 生效
 - `host01 最近 CPU 高告警怎么处理`
 - `host01 IO 逻辑读或者物理读高告警，给处理建议`
 
-## Skill 设计（MVP）
+## AI Skill 架构
 
-当前预置 Skill 分类：
+### 设计理念
 
-1. 巡检类（后续扩展）
-2. 故障处理类（当前已实现 CPU 告警 Skill MVP）
+- **MCP Tool 层（数据层）**：负责认证、取数、自检。原子操作，不做推理。
+- **AI Skill 层（智能层）**：由 LLM 驱动。Skill 是"可复用的认知能力"，以 SKILL.md 描述，由 LLM 执行。
+- **SKILL.md 即 Prompt**：每个 Skill 的 SKILL.md 就是 LLM 的 system prompt。新增诊断场景只需写一个 SKILL.md 文件，无需改 Python 代码。
 
-CPU 告警 Skill 目录：
+### AI Skill Engine 组成
+
+- **SkillRegistry**：启动时扫描 `skills/*/SKILL.md`，解析 YAML frontmatter，缓存元信息（name / description / triggers）
+- **SkillRouter（LLM）**：将用户问题 + 全部 Skill 摘要发给 DeepSeek，返回最匹配的 Skill 名称
+- **SkillExecutor（LLM）**：将完整 SKILL.md 作为 system prompt + OEM 数据作为 context + 用户问题，发给 DeepSeek 生成诊断
+
+技术栈：LangChain 1.0（ChatOpenAI / ChatPromptTemplate / LCEL Chain）+ DeepSeek API
+
+### Skill 目录结构
 
 ```text
 skills/cpu_alert_mvp/
-  SKILL.md
-  assets/output_template.md
-  references/cpu_alert_sop.md
-  scripts/compose_question.py
+  SKILL.md                    # Skill 定义（YAML frontmatter + Goal/Workflow/Constraints）
+  assets/output_template.md   # 输出模板参考
+  references/cpu_alert_sop.md # SOP 参考文档
+  scripts/compose_question.py # 辅助脚本
 ```
 
-Skill 执行边界：
+SKILL.md 包含：
 
-- MCP Tool 负责：问题识别/场景路由/OEM取数（数据层）
-- Skill 负责：模板化 SOP 输出（解释层）
+- YAML frontmatter：name / description / triggers / non_triggers / version / paradigm
+- 正文章节：Goal / Decision Tree / Workflow / Constraints / Resources / Validation
 
-代码调用流程（CPU 场景）：
+### 扩展新 Skill
 
-1. `fetch_data_from_oem` -> `AskOpsService.fetch_data()` 获取结构化数据；
-2. `ask_ops`（兼容入口）内部同样先调用 `fetch_data()`；
-3. `ask_ops` 再根据 `scenario` 选择 Skill（当前 `cpu_alert_mvp`）；
-4. `run_skill()` 调用 `render_cpu_alert_skill()` 完成模板化输出。
+1. 在 `skills/` 下新建目录（如 `skills/io_alert_mvp/`）
+2. 编写 `SKILL.md`，包含 YAML frontmatter 和结构化章节
+3. SkillRegistry 自动发现，SkillRouter 自动路由，无需改 Python 代码
 
-## 告警处理（SOP 固化）
+## 告警场景路由
 
-当前实现采用混合识别模式：
+采用混合识别模式：
 
 - 优先规则识别（稳定可控）
-- 规则不确定时再调用可选 LLM 分类（适配 Cline + DeepSeek）
+- 规则不确定时再调用 LLM 分类（DeepSeek）
 
-告警数据主来源为 **OEM incidents/events**（当前版本仅读取告警对象，不补充指标明细）。
+告警数据主来源为 **OEM incidents/events**。
 
 已内置场景：
 
-- CPU 高告警 SOP
-- IO 逻辑读/物理读高告警 SOP
-- 通用告警 SOP（无专用 SOP 时兜底）
+- CPU 高告警
+- IO 逻辑读/物理读高告警
+- 通用告警（无专用 Skill 时兜底）
 
-扩展方式：通过 `config/metric_map.yaml` 的 `alert_scenarios` 增加关键词、是否需要目标名，无需改动核心流程代码。
+扩展方式：通过 `config/metric_map.yaml` 的 `alert_scenarios` 增加关键词和配置。
 
-### 告警问答端到端流程（示例：`host01 最近 CPU 高告警怎么处理`）
+## 端到端流程
 
-1. **MCP 数据层接收问题**  
-   `fetch_data_from_oem` 接收 `question`，调用 `AskOpsService.fetch_data()`。
-2. **问题解析 + 场景路由**  
-   解析目标名/时间窗/意图，并通过规则优先 + 可选 LLM 兜底识别场景（如 `cpu_high`）。
-3. **参数校验**  
-   若命中 CPU/IO 场景但缺少目标名，则返回追问。
-4. **OEM 数据采集（只读）**  
-   拉取 `latestData` / `timeSeries` / `incidents` / `incident events`。
-5. **Skill 输出（CPU 告警 MVP）**  
-   根据 `skills/cpu_alert_mvp` 模板渲染结论、证据与 SOP 建议。
-6. **兼容入口**  
-   旧客户端调用 `ask_ops` 时，内部会先走 `fetch_data`，CPU 场景会自动走 Skill 输出。
+### 两条独立路径
+
+- **数据路径**：`fetch_data_from_oem` → 返回原始结构化 JSON（供 Cline 自行分析或展示）
+- **AI 诊断路径**：`run_skill` → 内部 fetch_data + AI Skill Engine → 返回 LLM 生成的诊断文本
+
+### AI 诊断完整流程（示例：`host01 最近 CPU 高告警怎么处理`）
+
+```
+步骤1  用户提问
+       Cline / CLI 调用 run_skill(question="host01 最近 CPU 高告警怎么处理", session_id=...)
+
+步骤2  数据层（规则驱动，不变）
+       2a. IntentParser（规则）: 提取 target_name=host01, time_range=24h, intent=单目标诊断
+       2b. AlertRouter（规则优先 + LLM fallback）: 识别场景 scenario=cpu_high
+       2c. 参数校验: 若命中 CPU/IO 场景但缺少目标名，返回追问
+       2d. OEM REST API（只读）: 拉取 incidents / events / latestData / timeSeries
+
+步骤3  AI Skill Engine（LLM 驱动）
+       3a. SkillRegistry: 已预加载 skills/*/SKILL.md 的元信息
+       3b. SkillRouter（LLM）: 问题 + Skill 摘要 → DeepSeek → 返回 "cpu-alert-diagnosis"
+       3c. SkillExecutor（LLM）: SKILL.md 作为 system prompt
+                                + OEM 数据（incidents/events/metrics）作为 context
+                                + 用户问题
+                                → DeepSeek → 按 Workflow/Constraints 生成回答
+
+步骤4  返回结构化诊断
+       固定 4 段格式：结论 / 证据 / SOP 建议 / 下一步
+
+步骤5  降级兼容
+       若 DEEPSEEK_API_KEY 未配置或 LLM 调用失败，回退到简单文本摘要
+```
 
 ## 兼容性与容错
 

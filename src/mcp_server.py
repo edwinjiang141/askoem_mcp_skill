@@ -10,8 +10,7 @@ from src.service import AskOpsService
 
 
 CONFIG_PATH = "config/metric_map.yaml"
-DEFAULT_KB_PATH = "docs/OEM_Grafana_AI_Gateway_Exadata_Solution_Report.md"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.2.0"
 
 config = load_metric_config(CONFIG_PATH)
 service = AskOpsService(config)
@@ -22,51 +21,13 @@ mcp = FastMCP("ai-gateway-mvp")
 def oem_login(oem_base_url: str | None, username: str, password: str) -> dict[str, Any]:
     """
     使用 OEM 账号登录并创建会话缓存。
-    返回 session_id，后续 ask_ops 直接复用。
+    返回 session_id，后续请求直接复用。
     """
     session_id = service.login(oem_base_url=oem_base_url or "", username=username, password=password)
     return {
         "ok": True,
         "session_id": session_id,
         "message": "登录成功。后续请求可仅传 session_id。",
-    }
-
-
-@mcp.tool()
-def ask_ops(
-    question: str,
-    session_id: str | None = None,
-    oem_base_url: str | None = None,
-    username: str | None = None,
-    password: str | None = None,
-    kb_path: str = DEFAULT_KB_PATH,
-) -> dict[str, Any]:
-    """
-    兼容入口（保留给旧客户端）：
-    - 内部先走 service.fetch_data() 做数据层处理；
-    - 命中 CPU 告警场景时再调用 Skill 引擎输出；
-    - 未命中 Skill 时保持兼容文本输出。
-
-    即：ask_ops = fetch_data + （可选）run_skill + 兼容输出。
-    """
-    result = service.ask(
-        question=question,
-        kb_path=kb_path,
-        session_id=session_id,
-        oem_base_url=oem_base_url,
-        username=username,
-        password=password,
-    )
-    if result.need_follow_up:
-        return {
-            "ok": False,
-            "result": result.follow_up_question,
-        }
-
-    return {
-        "ok": True,
-        "session_id": result.session_id,
-        "result": result.final_result,
     }
 
 
@@ -125,6 +86,39 @@ def fetch_data_from_oem(
 
 
 @mcp.tool()
+def run_skill(
+    question: str,
+    session_id: str | None = None,
+    oem_base_url: str | None = None,
+    username: str | None = None,
+    password: str | None = None,
+) -> dict[str, Any]:
+    """
+    AI 诊断统一入口：
+    1) 内部调用 fetch_data 获取 OEM 结构化数据
+    2) 通过 AI Skill Engine（SkillRouter + SkillExecutor）生成诊断
+    3) 返回 LLM 生成的结构化诊断文本（结论/证据/SOP建议/下一步）
+
+    降级行为：若 DEEPSEEK_API_KEY 未配置或 LLM 调用失败，返回简单文本摘要。
+    """
+    try:
+        return service.run_skill_with_llm(
+            question=question,
+            session_id=session_id,
+            oem_base_url=oem_base_url,
+            username=username,
+            password=password,
+        )
+    except Exception as e:
+        return {
+            "ok": False,
+            "session_id": session_id,
+            "skill_name": None,
+            "result": f"run_skill 执行异常: {e}",
+        }
+
+
+@mcp.tool()
 def health_check() -> dict[str, Any]:
     """
     调试与巡检工具：
@@ -136,7 +130,7 @@ def health_check() -> dict[str, Any]:
         "ok": True,
         "server": "ai-gateway-mvp",
         "version": SERVER_VERSION,
-        "tools": ["health_check", "oem_login", "fetch_data_from_oem", "ask_ops"],
+        "tools": ["health_check", "oem_login", "fetch_data_from_oem", "run_skill"],
         "config": {
             "default_base_url": config.default_base_url,
             "verify_ssl": config.verify_ssl,
