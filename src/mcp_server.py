@@ -42,16 +42,12 @@ def ask_ops(
     kb_path: str = DEFAULT_KB_PATH,
 ) -> dict[str, Any]:
     """
-    执行 AI Gateway MVP 4 步流程:
-    1) 识别问题
-    2) 调 OEM REST API 取监控数据
-    3) 查询单文档知识库
-    4) 组织结构化回答
+    兼容入口（保留给旧客户端）：
+    - 内部先走 service.fetch_data() 做数据层处理；
+    - 命中 CPU 告警场景时再调用 Skill 引擎输出；
+    - 未命中 Skill 时保持兼容文本输出。
 
-    告警类问题会走 AskOpsService 的告警编排分支:
-    - 场景识别（规则优先 + 可选LLM兜底）
-    - 拉取 incidents/events
-    - 返回 SOP 化处理建议
+    即：ask_ops = fetch_data + （可选）run_skill + 兼容输出。
     """
     result = service.ask(
         question=question,
@@ -75,6 +71,60 @@ def ask_ops(
 
 
 @mcp.tool()
+def fetch_data_from_oem(
+    question: str,
+    session_id: str | None = None,
+    oem_base_url: str | None = None,
+    username: str | None = None,
+    password: str | None = None,
+) -> dict[str, Any]:
+    """
+    数据层工具（MVP）：
+    1) 识别问题意图 + 场景路由
+    2) 调用 OEM REST API 获取结构化数据
+
+    不负责最终 SOP 文案组织（该职责由 Skill 层承担）。
+    该 tool 返回的数据会被 Skill 作为输入上下文使用。
+    """
+    fetched = service.fetch_data(
+        question=question,
+        session_id=session_id,
+        oem_base_url=oem_base_url,
+        username=username,
+        password=password,
+    )
+    if fetched.need_follow_up:
+        return {
+            "ok": False,
+            "session_id": fetched.session_id,
+            "result": fetched.follow_up_question,
+        }
+    return {
+        "ok": True,
+        "session_id": fetched.session_id,
+        "intent": {
+            "intent_type": fetched.intent_type,
+            "target_name": fetched.target_name,
+            "target_type_name": fetched.target_type_name,
+            "time_range": fetched.time_range,
+            "metric_keys": fetched.metric_keys,
+            "route_key": fetched.route_key,
+        },
+        "routing": {
+            "scenario": fetched.scenario,
+            "classifier": fetched.classifier,
+            "confidence": fetched.confidence,
+        },
+        "data": {
+            "latest_data": fetched.latest_data,
+            "metric_time_series": fetched.metric_time_series,
+            "incidents": fetched.incidents,
+            "events": fetched.events,
+        },
+    }
+
+
+@mcp.tool()
 def health_check() -> dict[str, Any]:
     """
     调试与巡检工具：
@@ -86,7 +136,7 @@ def health_check() -> dict[str, Any]:
         "ok": True,
         "server": "ai-gateway-mvp",
         "version": SERVER_VERSION,
-        "tools": ["health_check", "oem_login", "ask_ops"],
+        "tools": ["health_check", "oem_login", "fetch_data_from_oem", "ask_ops"],
         "config": {
             "default_base_url": config.default_base_url,
             "verify_ssl": config.verify_ssl,
