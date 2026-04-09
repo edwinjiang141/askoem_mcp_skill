@@ -162,6 +162,13 @@ Skill 执行边界：
 - MCP Tool 负责：问题识别/场景路由/OEM取数（数据层）
 - Skill 负责：模板化 SOP 输出（解释层）
 
+代码调用流程（CPU 场景）：
+
+1. `fetch_data_from_oem` -> `AskOpsService.fetch_data()` 获取结构化数据；
+2. `ask_ops`（兼容入口）内部同样先调用 `fetch_data()`；
+3. `ask_ops` 再根据 `scenario` 选择 Skill（当前 `cpu_alert_mvp`）；
+4. `run_skill()` 调用 `render_cpu_alert_skill()` 完成模板化输出。
+
 ## 告警处理（SOP 固化）
 
 当前实现采用混合识别模式：

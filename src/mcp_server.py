@@ -42,16 +42,12 @@ def ask_ops(
     kb_path: str = DEFAULT_KB_PATH,
 ) -> dict[str, Any]:
     """
-    执行 AI Gateway MVP 4 步流程:
-    1) 识别问题
-    2) 调 OEM REST API 取监控数据
-    3) 查询单文档知识库
-    4) 组织结构化回答
+    兼容入口（保留给旧客户端）：
+    - 内部先走 service.fetch_data() 做数据层处理；
+    - 命中 CPU 告警场景时再调用 Skill 引擎输出；
+    - 未命中 Skill 时保持兼容文本输出。
 
-    告警类问题会走 AskOpsService 的告警编排分支:
-    - 场景识别（规则优先 + 可选LLM兜底）
-    - 拉取 incidents/events
-    - 返回 SOP 化处理建议
+    即：ask_ops = fetch_data + （可选）run_skill + 兼容输出。
     """
     result = service.ask(
         question=question,
@@ -88,6 +84,7 @@ def fetch_data_from_oem(
     2) 调用 OEM REST API 获取结构化数据
 
     不负责最终 SOP 文案组织（该职责由 Skill 层承担）。
+    该 tool 返回的数据会被 Skill 作为输入上下文使用。
     """
     fetched = service.fetch_data(
         question=question,

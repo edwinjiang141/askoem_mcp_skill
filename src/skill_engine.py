@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from src.service import FetchDataResult
 from src.sop_engine import build_sop_recommendation
+
+if TYPE_CHECKING:
+    from src.service import FetchDataResult
 
 
 SKILL_BASE_DIR = Path("skills/cpu_alert_mvp")
@@ -24,7 +27,16 @@ def _load_template() -> str:
     return template_path.read_text(encoding="utf-8")
 
 
-def render_cpu_alert_skill(fetched: FetchDataResult) -> str:
+def render_cpu_alert_skill(fetched: "FetchDataResult") -> str:
+    """
+    CPU 告警 Skill 渲染入口。
+
+    输入：
+    - fetched: 由数据层（AskOpsService.fetch_data）返回的结构化结果。
+
+    输出：
+    - 已套用 Skill 模板的最终文本，包含结论、证据、SOP、下一步。
+    """
     target = fetched.target_name or "未指定目标"
     evidence = (
         f"scenario={fetched.scenario}, classifier={fetched.classifier}, confidence={fetched.confidence or 0:.2f}, "
@@ -46,4 +58,3 @@ def render_cpu_alert_skill(fetched: FetchDataResult) -> str:
         sop=sop,
         next_step="如需继续分析，请补充具体时间窗（如最近1小时）或补充并发业务变化信息。",
     )
-

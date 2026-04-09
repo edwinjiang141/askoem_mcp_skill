@@ -10,6 +10,7 @@ from src.knowledge_base import SingleDocKnowledgeBase
 from src.llm_classifier import LlmIntentClassifier
 from src.metric_config import MetricConfig
 from src.oem_client import OemClient
+from src.skill_engine import render_cpu_alert_skill
 from src.sop_engine import build_sop_recommendation
 
 
@@ -86,6 +87,16 @@ class AskOpsService:
         username: Optional[str] = None,
         password: Optional[str] = None,
     ) -> AskOpsResult:
+        """
+        ask() 为兼容入口（兼容老的 ask_ops tool 调用习惯）。
+
+        新版流程（请关注这里）：
+        1) 先调用 fetch_data() 执行「问题识别 + 场景路由 + OEM 取数」；
+        2) 再根据 fetch_data 的结果决定是否调用 Skill；
+        3) 命中 Skill（当前仅 cpu_alert_mvp）时，交给 Skill 引擎渲染；
+        4) 未命中 Skill 时，走兼容文本输出（并可附带单文档知识库提示）。
+        """
+        # Step-1: 统一数据层入口。这里不会直接做最终话术，只返回结构化数据。
         fetched = self.fetch_data(
             question=question,
             session_id=session_id,
@@ -93,6 +104,7 @@ class AskOpsService:
             username=username,
             password=password,
         )
+        # Step-2: 数据层若要求追问（例如缺少目标名），直接将追问返回给上层调用方。
         if fetched.need_follow_up:
             return AskOpsResult(
                 session_id=fetched.session_id,
@@ -101,17 +113,18 @@ class AskOpsService:
                 final_result=None,
             )
 
-        # MVP: CPU 告警场景优先走 Skill 输出模板。
-        if fetched.scenario == "cpu_high":
-            from src.skill_engine import render_cpu_alert_skill
-
+        # Step-3: 根据 fetch_data 的结构化结果选择 Skill。
+        # 当前 MVP 仅接入 cpu_alert_mvp，后续可按 scenario 扩展 skill 映射表。
+        skill_name = self._select_skill_for_fetch_result(fetched)
+        if skill_name:
             return AskOpsResult(
                 session_id=fetched.session_id,
                 need_follow_up=False,
                 follow_up_question=None,
-                final_result=render_cpu_alert_skill(fetched),
+                final_result=self.run_skill(skill_name=skill_name, fetched=fetched),
             )
 
+        # Step-4: 未命中 Skill 的兼容输出路径（保留旧行为，确保平滑迁移）。
         final_result = (
             f"已完成查询。目标: {fetched.target_name}，监控项: {(fetched.metric_keys[0] if fetched.metric_keys else 'unknown_metric')}，"
             f"时间范围: {fetched.time_range}。获取到 latestData {len(fetched.latest_data)} 条，"
@@ -137,6 +150,32 @@ class AskOpsService:
             final_result=final_result,
         )
 
+    def _select_skill_for_fetch_result(self, fetched: FetchDataResult) -> str | None:
+        """
+        Skill 选择策略（MVP）：
+        - 当场景路由命中 cpu_high 时，返回 cpu_alert_mvp；
+        - 其余场景暂不命中 Skill，走兼容输出。
+        """
+        if fetched.scenario == "cpu_high":
+            return "cpu_alert_mvp"
+        return None
+
+    @staticmethod
+    def run_skill(skill_name: str, fetched: FetchDataResult) -> str:
+        """
+        Skill 调用分发器。
+
+        设计目的：
+        - 将“从 OEM fetch data 后如何调用 Skill”集中到一个函数中，避免散落在 ask() 中。
+        - 便于后续按 skill_name 扩展更多场景（如 io_alert_mvp、巡检类 skill）。
+
+        当前实现：
+        - cpu_alert_mvp -> render_cpu_alert_skill(fetched)
+        """
+        if skill_name == "cpu_alert_mvp":
+            return render_cpu_alert_skill(fetched)
+        raise ValueError(f"未支持的 skill: {skill_name}")
+
     def fetch_data(
         self,
         question: str,
@@ -145,17 +184,16 @@ class AskOpsService:
         username: Optional[str] = None,
         password: Optional[str] = None,
     ) -> FetchDataResult:
-        # 告警类问题（例如“当前有哪些告警，如何处理”）的总入口说明：
-        # 1) ask() 先做轻量问题分流：若命中告警关键词，直接进入 _ask_alert()。
-        # 2) _ask_alert() 中先解析 target（若有），并做场景识别：
-        #    - 规则优先（alert_router）
-        #    - 低置信度时可选 LLM 兜底分类
-        # 3) 基于 OEM REST API 拉取数据（只读）：
-        #    - incidents（主）
-        #    - incident 对应 events（主）
-        # 4) 将“场景 + incidents/events 证据”送入 SOP 引擎，输出固定结构建议文本。
-        # 5) 返回 final_result 给 MCP 调用方（Cline/VS Code）。
-        # 当前版本刻意不做自动修复动作，也不执行写操作，保证可控和可审计。
+        """
+        数据层统一入口（供 `fetch_data_from_oem` tool 与 `ask()` 复用）。
+
+        该函数只做三件事：
+        A. 问题识别（intent/target/time_range）
+        B. 场景路由（cpu_high/io_high/...）
+        C. OEM 取数（latestData/timeSeries/incidents/events）
+
+        不做最终 Skill 文案渲染；Skill 渲染由 ask() -> run_skill() 触发。
+        """
         alert_related = is_alert_related_question(question)
         parsed = parse_intent(question, self._config.intent_metric_map)
         if parsed.need_follow_up and not alert_related:
