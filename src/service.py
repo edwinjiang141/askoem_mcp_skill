@@ -8,7 +8,7 @@ from src.alert_router import classify_alert_scenario
 from src.intent_parser import INTENT_METRIC_LIST, INTENT_TARGET_LIST, is_alert_related_question, parse_intent
 from src.llm_classifier import LlmIntentClassifier
 from src.metric_config import MetricConfig
-from src.oem_client import OemClient
+from src.oem_client import OemClient, OemDataBundle
 from src.skill_engine import AgentSkillsEngine
 
 
@@ -30,6 +30,11 @@ class FetchDataResult:
     metric_time_series: list[dict[str, Any]]
     incidents: list[dict[str, Any]]
     events: list[dict[str, Any]]
+    oem_errors: list[str] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.oem_errors is None:
+            self.oem_errors = []
 
 
 class AskOpsService:
@@ -92,14 +97,24 @@ class AskOpsService:
         输出: { ok, session_id, need_follow_up, follow_up_question, skill_name, result }
         降级: LLM 不可用时回退到简单文本摘要
         """
-        # 步骤 1: 数据层取数
-        fetched = self.fetch_data(
-            question=question,
-            session_id=session_id,
-            oem_base_url=oem_base_url,
-            username=username,
-            password=password,
-        )
+        # 步骤 1: 数据层取数（捕获认证异常，避免冒泡导致 Cline 误判为前置条件失败）
+        try:
+            fetched = self.fetch_data(
+                question=question,
+                session_id=session_id,
+                oem_base_url=oem_base_url,
+                username=username,
+                password=password,
+            )
+        except (ValueError, RuntimeError) as e:
+            return {
+                "ok": False,
+                "session_id": session_id,
+                "need_follow_up": False,
+                "follow_up_question": None,
+                "skill_name": None,
+                "result": str(e),
+            }
 
         if fetched.need_follow_up:
             return {
@@ -120,6 +135,7 @@ class AskOpsService:
             "events": fetched.events[:20],
             "latest_data": fetched.latest_data[:10],
             "metric_time_series": fetched.metric_time_series[:10],
+            "oem_errors": fetched.oem_errors,
         }
 
         # 步骤 3: 调用 AI Skill Engine（SkillRouter 选 Skill -> SkillExecutor 生成诊断）
@@ -136,6 +152,7 @@ class AskOpsService:
             "follow_up_question": None,
             "skill_name": skill_name,
             "result": result_text,
+            "oem_errors": fetched.oem_errors,
         }
 
     @staticmethod
@@ -290,34 +307,57 @@ class AskOpsService:
             classifier = route.classifier
             confidence = route.confidence
 
-        bundle = self._oem_client.fetch_bundle(
-            session=session,
-            endpoints=self._config.endpoints,
-            target_name=parsed.target_name,
-            route_config=self._merge_route_target_type(
-                self._config.intent_metric_map.get(parsed.route_key or "", {}),
-                parsed.target_type_name,
-            ),
-            time_range=parsed.time_range,
-        )
-        incidents = bundle.incidents
-        events = bundle.events
-        if scenario:
-            incidents = self._oem_client.list_recent_incidents(
+        # OEM 取数：任意 API 404/超时等不阻断流程，用空数据继续（OEM 版本兼容问题后续修复）
+        oem_errors: list[str] = []
+
+        try:
+            bundle = self._oem_client.fetch_bundle(
                 session=session,
                 endpoints=self._config.endpoints,
                 target_name=parsed.target_name,
-                target_type_name=parsed.target_type_name if parsed.target_name else None,
-                scenario=scenario,
-                question=question,
-                age_hours=24,
-                limit=50,
+                route_config=self._merge_route_target_type(
+                    self._config.intent_metric_map.get(parsed.route_key or "", {}),
+                    parsed.target_type_name,
+                ),
+                time_range=parsed.time_range,
             )
-            events = self._oem_client.list_events_by_incidents(
-                session=session,
-                endpoints=self._config.endpoints,
-                incidents=incidents,
+        except RuntimeError as e:
+            oem_errors.append(str(e))
+            bundle = OemDataBundle(
+                target={},
+                latest_data=[],
+                metric_time_series=[],
+                incidents=[],
+                events=[],
             )
+
+        incidents = bundle.incidents
+        events = bundle.events
+        if scenario:
+            try:
+                incidents = self._oem_client.list_recent_incidents(
+                    session=session,
+                    endpoints=self._config.endpoints,
+                    target_name=parsed.target_name,
+                    target_type_name=parsed.target_type_name if parsed.target_name else None,
+                    scenario=scenario,
+                    question=question,
+                    age_hours=24,
+                    limit=50,
+                )
+            except RuntimeError as e:
+                oem_errors.append(str(e))
+                incidents = []
+
+            try:
+                events = self._oem_client.list_events_by_incidents(
+                    session=session,
+                    endpoints=self._config.endpoints,
+                    incidents=incidents,
+                )
+            except RuntimeError as e:
+                oem_errors.append(str(e))
+                events = []
 
         return FetchDataResult(
             session_id=session.session_id,
@@ -336,6 +376,7 @@ class AskOpsService:
             metric_time_series=bundle.metric_time_series,
             incidents=incidents,
             events=events,
+            oem_errors=oem_errors,
         )
 
     # ------------------------------------------------------------------

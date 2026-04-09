@@ -56,6 +56,9 @@ def _extract_target_name(question: str) -> str | None:
         "cpu",
         "host",
         "hosts",
+        "database",
+        "instance",
+        "DB",
         "metric",
         "metrics",
         "monitor",
@@ -88,7 +91,7 @@ def _detect_target_type(question: str) -> str:
 def _detect_intent(question: str) -> str:
     q = question.lower()
     if any(k in q for k in ["列出", "清单", "列表", "有哪些"]) and any(
-        k in q for k in ["主机", "host", "目标", "监控"]
+        k in q for k in ["主机", '数据库',"数据库实例","database instsance","database","host", "目标", "监控"]
     ):
         return INTENT_TARGET_LIST
     if any(k in q for k in ["监控项", "指标", "metric", "监控指标"]) and any(

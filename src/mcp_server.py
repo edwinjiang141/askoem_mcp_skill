@@ -41,11 +41,14 @@ def fetch_data_from_oem(
 ) -> dict[str, Any]:
     """
     数据层工具（MVP）：
+    - 传入 session_id（由 oem_login 返回）即可，无需重复登录
+    - 或传入 oem_base_url + username + password 自动登录
+
+    执行流程：
     1) 识别问题意图 + 场景路由
     2) 调用 OEM REST API 获取结构化数据
 
-    不负责最终 SOP 文案组织（该职责由 Skill 层承担）。
-    该 tool 返回的数据会被 Skill 作为输入上下文使用。
+    该 tool 返回原始结构化数据，不负责 SOP 文案组织（诊断由 run_skill 承担）。
     """
     fetched = service.fetch_data(
         question=question,
@@ -94,28 +97,24 @@ def run_skill(
     password: str | None = None,
 ) -> dict[str, Any]:
     """
-    AI 诊断统一入口：
-    1) 内部调用 fetch_data 获取 OEM 结构化数据
+    AI 诊断统一入口（认证方式与 fetch_data_from_oem 相同）：
+    - 传入 session_id（由 oem_login 返回）即可，无需重复登录
+    - 或传入 oem_base_url + username + password 自动登录
+
+    执行流程：
+    1) 内部调用 fetch_data 获取 OEM 结构化数据（复用已有 session）
     2) 通过 AI Skill Engine（SkillRouter + SkillExecutor）生成诊断
     3) 返回 LLM 生成的结构化诊断文本（结论/证据/SOP建议/下一步）
 
     降级行为：若 DEEPSEEK_API_KEY 未配置或 LLM 调用失败，返回简单文本摘要。
     """
-    try:
-        return service.run_skill_with_llm(
-            question=question,
-            session_id=session_id,
-            oem_base_url=oem_base_url,
-            username=username,
-            password=password,
-        )
-    except Exception as e:
-        return {
-            "ok": False,
-            "session_id": session_id,
-            "skill_name": None,
-            "result": f"run_skill 执行异常: {e}",
-        }
+    return service.run_skill_with_llm(
+        question=question,
+        session_id=session_id,
+        oem_base_url=oem_base_url,
+        username=username,
+        password=password,
+    )
 
 
 @mcp.tool()
