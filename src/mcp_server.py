@@ -75,6 +75,59 @@ def ask_ops(
 
 
 @mcp.tool()
+def fetch_data_from_oem(
+    question: str,
+    session_id: str | None = None,
+    oem_base_url: str | None = None,
+    username: str | None = None,
+    password: str | None = None,
+) -> dict[str, Any]:
+    """
+    数据层工具（MVP）：
+    1) 识别问题意图 + 场景路由
+    2) 调用 OEM REST API 获取结构化数据
+
+    不负责最终 SOP 文案组织（该职责由 Skill 层承担）。
+    """
+    fetched = service.fetch_data(
+        question=question,
+        session_id=session_id,
+        oem_base_url=oem_base_url,
+        username=username,
+        password=password,
+    )
+    if fetched.need_follow_up:
+        return {
+            "ok": False,
+            "session_id": fetched.session_id,
+            "result": fetched.follow_up_question,
+        }
+    return {
+        "ok": True,
+        "session_id": fetched.session_id,
+        "intent": {
+            "intent_type": fetched.intent_type,
+            "target_name": fetched.target_name,
+            "target_type_name": fetched.target_type_name,
+            "time_range": fetched.time_range,
+            "metric_keys": fetched.metric_keys,
+            "route_key": fetched.route_key,
+        },
+        "routing": {
+            "scenario": fetched.scenario,
+            "classifier": fetched.classifier,
+            "confidence": fetched.confidence,
+        },
+        "data": {
+            "latest_data": fetched.latest_data,
+            "metric_time_series": fetched.metric_time_series,
+            "incidents": fetched.incidents,
+            "events": fetched.events,
+        },
+    }
+
+
+@mcp.tool()
 def health_check() -> dict[str, Any]:
     """
     调试与巡检工具：
@@ -86,7 +139,7 @@ def health_check() -> dict[str, Any]:
         "ok": True,
         "server": "ai-gateway-mvp",
         "version": SERVER_VERSION,
-        "tools": ["health_check", "oem_login", "ask_ops"],
+        "tools": ["health_check", "oem_login", "fetch_data_from_oem", "ask_ops"],
         "config": {
             "default_base_url": config.default_base_url,
             "verify_ssl": config.verify_ssl,

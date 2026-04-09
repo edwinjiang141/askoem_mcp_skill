@@ -1,23 +1,24 @@
 # AI Gateway MCP MVP
 
-AI Gateway 的 MCP Server 最小实现，面向 OEM 只读问答场景。
+AI Gateway 的 MCP Server 最小实现，面向 OEM 只读诊断场景。
 
-当前主流程：
+当前推荐主流程（MVP-技能化改造）：
 
 1. 识别问题意图与目标类型
 2. 调用 OEM REST API 取数
-3. （按需）查询单文档知识库
-4. 返回最终结果文本
+3. 调用预定义 Skill 进行 SOP 组织与输出
+4. 返回结构化结果文本
 
 ## 项目结构
 
-- `src/mcp_server.py`：MCP Server 入口（`oem_login`、`ask_ops`）
-- `src/service.py`：主流程编排与结果组织
+- `src/mcp_server.py`：MCP Server 入口（`oem_login`、`fetch_data_from_oem`、`health_check`、`ask_ops` 兼容）
+- `src/service.py`：数据层编排（问题识别、路由、OEM 取数）与兼容问答入口
 - `src/intent_parser.py`：意图识别、目标名抽取、目标类型识别
 - `src/oem_client.py`：OEM REST 客户端（只读，含兼容降级逻辑）
 - `src/auth_session.py`：会话缓存（TTL 30 分钟）
-- `src/knowledge_base.py`：单文档检索
+- `src/skill_engine.py`：Skill 输出渲染引擎（MVP 提供 CPU 告警 Skill）
 - `config/metric_map.yaml`：OEM 接口配置、默认地址、意图映射
+- `skills/cpu_alert_mvp/`：CPU 告警场景 Skill（`SKILL.md` + assets/references/scripts）
 
 ## 快速启动
 
@@ -94,7 +95,7 @@ AI_GATEWAY_MCP_MOUNT_PATH=/mcp          # 仅 sse 生效
 2. 运行 `python -m src.mcp_server_http` 暴露 MCP HTTP 服务。
 3. Cline/Cursor 客户端改为配置远程 MCP 地址，而不是本地 `command + args`。
 
-## MCP 工具
+## MCP 工具（技能化改造阶段）
 
 ### `oem_login`
 
@@ -108,20 +109,28 @@ AI_GATEWAY_MCP_MOUNT_PATH=/mcp          # 仅 sse 生效
 
 - `session_id`
 
-### `ask_ops`
+### `fetch_data_from_oem`
 
 参数：
 
 - `question`（必填）
 - `session_id`（推荐）
 - 或 `oem_base_url + username + password`
-- `kb_path`（可选）
 
-返回（当前版本）：
+返回（结构化数据）：
 
 - `ok`
 - `session_id`（成功时）
-- `result`（仅最终结果文本，不输出中间过程结构）
+- `intent`（识别结果）
+- `routing`（场景路由结果）
+- `data`（latestData/timeSeries/incidents/events）
+
+### `ask_ops`（兼容入口）
+
+说明：
+
+- 保留用于兼容旧客户端调用。
+- 新流程中，`ask_ops` 内部先走 `fetch_data` 数据层，再按场景调用 Skill 渲染（当前已接入 CPU 告警 Skill）。
 
 ## 当前支持的通用查询示例
 
@@ -130,6 +139,28 @@ AI_GATEWAY_MCP_MOUNT_PATH=/mcp          # 仅 sse 生效
 - `19test1 cpu 利用率多少`
 - `host01 最近 CPU 高告警怎么处理`
 - `host01 IO 逻辑读或者物理读高告警，给处理建议`
+
+## Skill 设计（MVP）
+
+当前预置 Skill 分类：
+
+1. 巡检类（后续扩展）
+2. 故障处理类（当前已实现 CPU 告警 Skill MVP）
+
+CPU 告警 Skill 目录：
+
+```text
+skills/cpu_alert_mvp/
+  SKILL.md
+  assets/output_template.md
+  references/cpu_alert_sop.md
+  scripts/compose_question.py
+```
+
+Skill 执行边界：
+
+- MCP Tool 负责：问题识别/场景路由/OEM取数（数据层）
+- Skill 负责：模板化 SOP 输出（解释层）
 
 ## 告警处理（SOP 固化）
 
@@ -148,29 +179,20 @@ AI_GATEWAY_MCP_MOUNT_PATH=/mcp          # 仅 sse 生效
 
 扩展方式：通过 `config/metric_map.yaml` 的 `alert_scenarios` 增加关键词、是否需要目标名，无需改动核心流程代码。
 
-### 告警问答端到端流程（示例：`当前有哪些告警，如何处理`）
+### 告警问答端到端流程（示例：`host01 最近 CPU 高告警怎么处理`）
 
-1. **MCP 入口接收问题**  
-   `ask_ops` 接收 `question` 后调用 `AskOpsService.ask()`。
-2. **问题分流**  
-   `ask()` 先判断是否为告警类问题，命中后进入 `_ask_alert()` 分支。
-3. **场景识别**  
-   `_ask_alert()` 调用 `alert_router`：
-   - 规则优先（配置关键词匹配）
-   - 低置信度时可选 LLM 兜底分类
-4. **参数与上下文提取**  
-   从问题中尽量提取目标名/时间提示；若未提供目标，也会继续走模拟 incident + SOP 输出流程。
-4. **参数校验**  
-   若场景要求目标名（如 CPU/IO），但问题中未给出目标，则返回追问。
-5. **OEM 数据采集（只读）**  
-   仅拉取：
-   - `incidents`
-   - `incident events`
-6. **SOP 生成**  
-   将 `场景 + incidents/events` 送入 `sop_engine`，输出固定模板建议（非 LLM 自由生成）。
-   将 `场景 + incidents/events` 送入 `sop_engine`，输出固定模板建议。
-7. **结果返回**  
-   返回结构化文本（识别结果 + 数据来源 + SOP建议）给 Cline/VS Code。
+1. **MCP 数据层接收问题**  
+   `fetch_data_from_oem` 接收 `question`，调用 `AskOpsService.fetch_data()`。
+2. **问题解析 + 场景路由**  
+   解析目标名/时间窗/意图，并通过规则优先 + 可选 LLM 兜底识别场景（如 `cpu_high`）。
+3. **参数校验**  
+   若命中 CPU/IO 场景但缺少目标名，则返回追问。
+4. **OEM 数据采集（只读）**  
+   拉取 `latestData` / `timeSeries` / `incidents` / `incident events`。
+5. **Skill 输出（CPU 告警 MVP）**  
+   根据 `skills/cpu_alert_mvp` 模板渲染结论、证据与 SOP 建议。
+6. **兼容入口**  
+   旧客户端调用 `ask_ops` 时，内部会先走 `fetch_data`，CPU 场景会自动走 Skill 输出。
 
 ## 兼容性与容错
 
