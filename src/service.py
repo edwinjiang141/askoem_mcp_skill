@@ -10,6 +10,7 @@ from src.knowledge_base import SingleDocKnowledgeBase
 from src.llm_classifier import LlmIntentClassifier
 from src.metric_config import MetricConfig
 from src.oem_client import OemClient
+from src.skill_engine import render_cpu_alert_skill
 from src.sop_engine import build_sop_recommendation
 
 
@@ -19,6 +20,26 @@ class AskOpsResult:
     need_follow_up: bool
     follow_up_question: str | None
     final_result: str | None
+
+
+@dataclass
+class FetchDataResult:
+    session_id: str | None
+    need_follow_up: bool
+    follow_up_question: str | None
+    intent_type: str | None
+    target_name: str | None
+    target_type_name: str | None
+    time_range: str | None
+    metric_keys: list[str]
+    route_key: str | None
+    scenario: str | None
+    classifier: str | None
+    confidence: float | None
+    latest_data: list[dict[str, Any]]
+    metric_time_series: list[dict[str, Any]]
+    incidents: list[dict[str, Any]]
+    events: list[dict[str, Any]]
 
 
 class AskOpsService:
@@ -66,27 +87,194 @@ class AskOpsService:
         username: Optional[str] = None,
         password: Optional[str] = None,
     ) -> AskOpsResult:
-        # 告警类问题（例如“当前有哪些告警，如何处理”）的总入口说明：
-        # 1) ask() 先做轻量问题分流：若命中告警关键词，直接进入 _ask_alert()。
-        # 2) _ask_alert() 中先解析 target（若有），并做场景识别：
-        #    - 规则优先（alert_router）
-        #    - 低置信度时可选 LLM 兜底分类
-        # 3) 基于 OEM REST API 拉取数据（只读）：
-        #    - incidents（主）
-        #    - incident 对应 events（主）
-        # 4) 将“场景 + incidents/events 证据”送入 SOP 引擎，输出固定结构建议文本。
-        # 5) 返回 final_result 给 MCP 调用方（Cline/VS Code）。
-        # 当前版本刻意不做自动修复动作，也不执行写操作，保证可控和可审计。
-        if is_alert_related_question(question):
-            return self._ask_alert(question, session_id, oem_base_url, username, password)
+        """
+        ask() 为兼容入口（兼容老的 ask_ops tool 调用习惯）。
 
-        parsed = parse_intent(question, self._config.intent_metric_map)
-        if parsed.need_follow_up:
+        新版流程（请关注这里）：
+        1) 先按用户问题选择 Skill（skill-first）；
+        2) 若命中 Skill，按 Skill workflow 执行（其中可调用 fetch_data）；
+        3) 若未命中 Skill，再走兼容数据流：fetch_data -> 兼容输出。
+        """
+        # Step-1: 先按问题选择 Skill（符合 skill-first 设计目标）。
+        skill_name = self.select_skill_by_question(question)
+        if skill_name:
+            return self.execute_skill_workflow(
+                skill_name=skill_name,
+                question=question,
+                session_id=session_id,
+                oem_base_url=oem_base_url,
+                username=username,
+                password=password,
+            )
+
+        # Step-2: 未命中 Skill 的兼容路径（保留旧行为，确保平滑迁移）。
+        fetched = self.fetch_data(
+            question=question,
+            session_id=session_id,
+            oem_base_url=oem_base_url,
+            username=username,
+            password=password,
+        )
+        if fetched.need_follow_up:
             return AskOpsResult(
+                session_id=fetched.session_id,
+                need_follow_up=True,
+                follow_up_question=fetched.follow_up_question,
+                final_result=None,
+            )
+
+        final_result = (
+            f"已完成查询。目标: {fetched.target_name}，监控项: {(fetched.metric_keys[0] if fetched.metric_keys else 'unknown_metric')}，"
+            f"时间范围: {fetched.time_range}。获取到 latestData {len(fetched.latest_data)} 条，"
+            f"timeSeries {len(fetched.metric_time_series)} 条，incidents {len(fetched.incidents)} 条，events {len(fetched.events)} 条。"
+        )
+
+        # 单文档知识库仍参与流程，但仅用于补充最终一句建议，不输出中间细节。
+        try:
+            kb = SingleDocKnowledgeBase(kb_path)
+            kb_keywords = [fetched.intent_type or "", *(fetched.metric_keys or [])]
+            if fetched.target_name:
+                kb_keywords.append(fetched.target_name)
+            snippets = kb.search(kb_keywords, top_k=1)
+            if snippets:
+                final_result += f" 建议参考知识库: {snippets[0].source}。"
+        except Exception:
+            pass
+
+        return AskOpsResult(
+            session_id=fetched.session_id,
+            need_follow_up=False,
+            follow_up_question=None,
+            final_result=final_result,
+        )
+
+    @staticmethod
+    def select_skill_by_question(question: str) -> str | None:
+        """
+        Skill 预选择（skill-first）：
+        - 先基于用户问题选择候选 Skill；
+        - 由 Skill workflow 再决定是否继续执行/追问/回退。
+        """
+        if is_alert_related_question(question) and any(k in question.lower() for k in ["cpu", "处理器", "负载"]):
+            return "cpu_alert_mvp"
+        return None
+
+    def _select_skill_for_fetch_result(self, fetched: FetchDataResult) -> str | None:
+        """
+        Skill 选择策略（MVP）：
+        - 当场景路由命中 cpu_high 时，返回 cpu_alert_mvp；
+        - 其余场景暂不命中 Skill，走兼容输出。
+        """
+        if fetched.scenario == "cpu_high":
+            return "cpu_alert_mvp"
+        return None
+
+    def execute_skill_workflow(
+        self,
+        skill_name: str,
+        question: str,
+        session_id: Optional[str],
+        oem_base_url: Optional[str],
+        username: Optional[str],
+        password: Optional[str],
+    ) -> AskOpsResult:
+        """
+        执行 Skill workflow（MVP 版本）。
+
+        当前 cpu_alert_mvp 的 workflow 为：
+        1) 调用 fetch_data() 获取结构化数据；
+        2) 若需要追问则直接返回；
+        3) 若场景命中 cpu_high，调用 run_skill() 输出；
+        4) 否则回退到兼容提示，避免误用 Skill。
+        """
+        fetched = self.fetch_data(
+            question=question,
+            session_id=session_id,
+            oem_base_url=oem_base_url,
+            username=username,
+            password=password,
+        )
+        if fetched.need_follow_up:
+            return AskOpsResult(
+                session_id=fetched.session_id,
+                need_follow_up=True,
+                follow_up_question=fetched.follow_up_question,
+                final_result=None,
+            )
+
+        resolved_skill = self._select_skill_for_fetch_result(fetched)
+        if resolved_skill != skill_name:
+            return AskOpsResult(
+                session_id=fetched.session_id,
+                need_follow_up=False,
+                follow_up_question=None,
+                final_result=(
+                    f"已匹配 Skill={skill_name}，但数据路由场景为 {fetched.scenario}，"
+                    "当前未命中该 Skill 的执行条件，请改用更具体的 CPU 告警问题。"
+                ),
+            )
+
+        return AskOpsResult(
+            session_id=fetched.session_id,
+            need_follow_up=False,
+            follow_up_question=None,
+            final_result=self.run_skill(skill_name=skill_name, fetched=fetched),
+        )
+
+    @staticmethod
+    def run_skill(skill_name: str, fetched: FetchDataResult) -> str:
+        """
+        Skill 调用分发器。
+
+        设计目的：
+        - 将“从 OEM fetch data 后如何调用 Skill”集中到一个函数中，避免散落在 ask() 中。
+        - 便于后续按 skill_name 扩展更多场景（如 io_alert_mvp、巡检类 skill）。
+
+        当前实现：
+        - cpu_alert_mvp -> render_cpu_alert_skill(fetched)
+        """
+        if skill_name == "cpu_alert_mvp":
+            return render_cpu_alert_skill(fetched)
+        raise ValueError(f"未支持的 skill: {skill_name}")
+
+    def fetch_data(
+        self,
+        question: str,
+        session_id: Optional[str] = None,
+        oem_base_url: Optional[str] = None,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+    ) -> FetchDataResult:
+        """
+        数据层统一入口（供 `fetch_data_from_oem` tool 与 `ask()` 复用）。
+
+        该函数只做三件事：
+        A. 问题识别（intent/target/time_range）
+        B. 场景路由（cpu_high/io_high/...）
+        C. OEM 取数（latestData/timeSeries/incidents/events）
+
+        不做最终 Skill 文案渲染；Skill 渲染由 ask() -> run_skill() 触发。
+        """
+        alert_related = is_alert_related_question(question)
+        parsed = parse_intent(question, self._config.intent_metric_map)
+        if parsed.need_follow_up and not alert_related:
+            return FetchDataResult(
                 session_id=session_id,
                 need_follow_up=True,
                 follow_up_question=parsed.follow_up_question,
-                final_result=None,
+                intent_type=parsed.intent_type,
+                target_name=parsed.target_name,
+                target_type_name=parsed.target_type_name,
+                time_range=parsed.time_range,
+                metric_keys=parsed.metric_keys,
+                route_key=parsed.route_key,
+                scenario=None,
+                classifier=None,
+                confidence=None,
+                latest_data=[],
+                metric_time_series=[],
+                incidents=[],
+                events=[],
             )
 
         session = self._resolve_session(
@@ -102,17 +290,23 @@ class AskOpsService:
                 endpoints=self._config.endpoints,
                 limit=200,
             )
-            table = self._format_table(
-                rows=host_rows,
-                headers=["HostName", "Status", "BootTime", "IP", "OS", "Version"],
-            )
-            return AskOpsResult(
+            return FetchDataResult(
                 session_id=session.session_id,
                 need_follow_up=False,
                 follow_up_question=None,
-                final_result=(
-                    f"当前共查询到 {len(host_rows)} 个监控主机。\n{table}"
-                ),
+                intent_type=parsed.intent_type,
+                target_name=parsed.target_name,
+                target_type_name=parsed.target_type_name,
+                time_range=parsed.time_range,
+                metric_keys=[],
+                route_key=parsed.route_key,
+                scenario=None,
+                classifier=None,
+                confidence=None,
+                latest_data=host_rows,
+                metric_time_series=[],
+                incidents=[],
+                events=[],
             )
 
         if parsed.intent_type == INTENT_METRIC_LIST and parsed.target_name:
@@ -127,16 +321,58 @@ class AskOpsService:
             if not group_names:
                 group_names = [x.get("name") for x in groups if isinstance(x.get("name"), str)]
             group_names = [x for x in group_names if x]
-            preview = group_names[:30]
-            return AskOpsResult(
+            metric_rows = [{"metricGroupName": x} for x in group_names]
+            return FetchDataResult(
                 session_id=session.session_id,
                 need_follow_up=False,
                 follow_up_question=None,
-                final_result=(
-                    f"目标 {parsed.target_name} 共查询到 {len(group_names)} 个监控项。"
-                    + (f" 监控项(前{len(preview)}个): {', '.join(preview)}" if preview else "")
-                ),
+                intent_type=parsed.intent_type,
+                target_name=parsed.target_name,
+                target_type_name=parsed.target_type_name,
+                time_range=parsed.time_range,
+                metric_keys=[],
+                route_key=parsed.route_key,
+                scenario=None,
+                classifier=None,
+                confidence=None,
+                latest_data=metric_rows,
+                metric_time_series=[],
+                incidents=[],
+                events=[],
             )
+
+        scenario = None
+        classifier = None
+        confidence: float | None = None
+        if alert_related:
+            route = classify_alert_scenario(
+                question=question,
+                alert_scenarios=self._config.alert_scenarios,
+                llm=self._llm_classifier,
+            )
+            route_cfg = self._config.alert_scenarios.get(route.scenario, {})
+            if route_cfg.get("require_target") and not parsed.target_name:
+                return FetchDataResult(
+                    session_id=session.session_id,
+                    need_follow_up=True,
+                    follow_up_question="该告警场景需要目标名称，请补充主机名（例如：host01）。",
+                    intent_type=parsed.intent_type,
+                    target_name=parsed.target_name,
+                    target_type_name=parsed.target_type_name,
+                    time_range=parsed.time_range,
+                    metric_keys=parsed.metric_keys,
+                    route_key=parsed.route_key,
+                    scenario=route.scenario,
+                    classifier=route.classifier,
+                    confidence=route.confidence,
+                    latest_data=[],
+                    metric_time_series=[],
+                    incidents=[],
+                    events=[],
+                )
+            scenario = route.scenario
+            classifier = route.classifier
+            confidence = route.confidence
 
         bundle = self._oem_client.fetch_bundle(
             session=session,
@@ -148,37 +384,42 @@ class AskOpsService:
             ),
             time_range=parsed.time_range,
         )
+        incidents = bundle.incidents
+        events = bundle.events
+        if scenario:
+            incidents = self._oem_client.list_recent_incidents(
+                session=session,
+                endpoints=self._config.endpoints,
+                target_name=parsed.target_name,
+                target_type_name=parsed.target_type_name if parsed.target_name else None,
+                scenario=scenario,
+                question=question,
+                age_hours=24,
+                limit=50,
+            )
+            events = self._oem_client.list_events_by_incidents(
+                session=session,
+                endpoints=self._config.endpoints,
+                incidents=incidents,
+            )
 
-        metric_key = parsed.metric_keys[0] if parsed.metric_keys else "unknown_metric"
-        latest_count = len(bundle.latest_data)
-        ts_count = len(bundle.metric_time_series)
-        incident_count = len(bundle.incidents)
-        event_count = len(bundle.events)
-
-        # 单文档知识库仍参与流程，但仅用于补充最终一句建议，不输出中间细节。
-        kb_tip = ""
-        try:
-            kb = SingleDocKnowledgeBase(kb_path)
-            kb_keywords = [parsed.intent_type, metric_key]
-            if parsed.target_name:
-                kb_keywords.append(parsed.target_name)
-            snippets = kb.search(kb_keywords, top_k=1)
-            if snippets:
-                kb_tip = f" 建议参考知识库: {snippets[0].source}。"
-        except Exception:
-            kb_tip = ""
-
-        final_result = (
-            f"已完成查询。目标: {parsed.target_name}，监控项: {metric_key}，时间范围: {parsed.time_range}。"
-            f" 获取到 latestData {latest_count} 条，timeSeries {ts_count} 条，incidents {incident_count} 条，events {event_count} 条。"
-            f"{kb_tip}"
-        )
-
-        return AskOpsResult(
+        return FetchDataResult(
             session_id=session.session_id,
             need_follow_up=False,
             follow_up_question=None,
-            final_result=final_result,
+            intent_type=parsed.intent_type,
+            target_name=parsed.target_name,
+            target_type_name=parsed.target_type_name,
+            time_range=parsed.time_range,
+            metric_keys=parsed.metric_keys,
+            route_key=parsed.route_key,
+            scenario=scenario,
+            classifier=classifier,
+            confidence=confidence,
+            latest_data=bundle.latest_data,
+            metric_time_series=bundle.metric_time_series,
+            incidents=incidents,
+            events=events,
         )
 
     def _ask_alert(
@@ -327,6 +568,11 @@ class AskOpsService:
             if session:
                 return session
             raise ValueError("session_id 无效或已过期，请重新登录。")
+
+        # 兼容场景：客户端未透传 session_id，但当前进程缓存里已有可复用会话。
+        latest_session = self._sessions.get_latest()
+        if latest_session:
+            return latest_session
 
         if not oem_base_url or not username or not password:
             fallback_base = oem_base_url or self._config.default_base_url

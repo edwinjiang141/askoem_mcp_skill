@@ -51,3 +51,13 @@ class SessionCache:
             return None
         return session
 
+    def get_latest(self) -> Optional[OemSession]:
+        """
+        返回最近创建且未过期的会话。
+        用于“已登录但未显式传 session_id”的复用场景。
+        """
+        for sid in reversed(list(self._sessions.keys())):
+            session = self.get(sid)
+            if session:
+                return session
+        return None

@@ -6,6 +6,8 @@ from typing import Optional
 
 import httpx
 
+from src.env_loader import load_env_from_file
+
 
 class LlmIntentClassifier:
     """
@@ -14,9 +16,27 @@ class LlmIntentClassifier:
     """
 
     def __init__(self, timeout_seconds: int = 15):
-        self._endpoint = os.getenv("AI_GATEWAY_LLM_ENDPOINT", "").strip()
-        self._api_key = os.getenv("AI_GATEWAY_LLM_API_KEY", "").strip()
-        self._model = os.getenv("AI_GATEWAY_LLM_MODEL", "deepseek-chat").strip()
+        # 从项目根目录 .env 加载（如 DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL）。
+        load_env_from_file(".env")
+        self._endpoint = (
+            os.getenv("AI_GATEWAY_LLM_ENDPOINT", "").strip()
+            or os.getenv("DEEPSEEK_ENDPOINT", "").strip()
+            or os.getenv("DEEPSEEK_BASE_URL", "").strip()
+        )
+        self._api_key = (
+            os.getenv("AI_GATEWAY_LLM_API_KEY", "").strip()
+            or os.getenv("DEEPSEEK_API_KEY", "").strip()
+        )
+        self._model = (
+            os.getenv("AI_GATEWAY_LLM_MODEL", "").strip()
+            or os.getenv("DEEPSEEK_MODEL", "").strip()
+            or "deepseek-chat"
+        )
+        if self._endpoint and self._endpoint.endswith("/"):
+            self._endpoint = self._endpoint.rstrip("/")
+        # 兼容仅配置 base_url 的场景：自动拼接 OpenAI-Compatible chat/completions。
+        if self._endpoint and "chat/completions" not in self._endpoint:
+            self._endpoint = f"{self._endpoint}/chat/completions"
         self._timeout = timeout_seconds
 
     @property
