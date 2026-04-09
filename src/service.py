@@ -21,6 +21,26 @@ class AskOpsResult:
     final_result: str | None
 
 
+@dataclass
+class FetchDataResult:
+    session_id: str | None
+    need_follow_up: bool
+    follow_up_question: str | None
+    intent_type: str | None
+    target_name: str | None
+    target_type_name: str | None
+    time_range: str | None
+    metric_keys: list[str]
+    route_key: str | None
+    scenario: str | None
+    classifier: str | None
+    confidence: float | None
+    latest_data: list[dict[str, Any]]
+    metric_time_series: list[dict[str, Any]]
+    incidents: list[dict[str, Any]]
+    events: list[dict[str, Any]]
+
+
 class AskOpsService:
     def __init__(self, config: MetricConfig):
         self._config = config
@@ -66,6 +86,65 @@ class AskOpsService:
         username: Optional[str] = None,
         password: Optional[str] = None,
     ) -> AskOpsResult:
+        fetched = self.fetch_data(
+            question=question,
+            session_id=session_id,
+            oem_base_url=oem_base_url,
+            username=username,
+            password=password,
+        )
+        if fetched.need_follow_up:
+            return AskOpsResult(
+                session_id=fetched.session_id,
+                need_follow_up=True,
+                follow_up_question=fetched.follow_up_question,
+                final_result=None,
+            )
+
+        # MVP: CPU 告警场景优先走 Skill 输出模板。
+        if fetched.scenario == "cpu_high":
+            from src.skill_engine import render_cpu_alert_skill
+
+            return AskOpsResult(
+                session_id=fetched.session_id,
+                need_follow_up=False,
+                follow_up_question=None,
+                final_result=render_cpu_alert_skill(fetched),
+            )
+
+        final_result = (
+            f"已完成查询。目标: {fetched.target_name}，监控项: {(fetched.metric_keys[0] if fetched.metric_keys else 'unknown_metric')}，"
+            f"时间范围: {fetched.time_range}。获取到 latestData {len(fetched.latest_data)} 条，"
+            f"timeSeries {len(fetched.metric_time_series)} 条，incidents {len(fetched.incidents)} 条，events {len(fetched.events)} 条。"
+        )
+
+        # 单文档知识库仍参与流程，但仅用于补充最终一句建议，不输出中间细节。
+        try:
+            kb = SingleDocKnowledgeBase(kb_path)
+            kb_keywords = [fetched.intent_type or "", *(fetched.metric_keys or [])]
+            if fetched.target_name:
+                kb_keywords.append(fetched.target_name)
+            snippets = kb.search(kb_keywords, top_k=1)
+            if snippets:
+                final_result += f" 建议参考知识库: {snippets[0].source}。"
+        except Exception:
+            pass
+
+        return AskOpsResult(
+            session_id=fetched.session_id,
+            need_follow_up=False,
+            follow_up_question=None,
+            final_result=final_result,
+        )
+
+    def fetch_data(
+        self,
+        question: str,
+        session_id: Optional[str] = None,
+        oem_base_url: Optional[str] = None,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+    ) -> FetchDataResult:
         # 告警类问题（例如“当前有哪些告警，如何处理”）的总入口说明：
         # 1) ask() 先做轻量问题分流：若命中告警关键词，直接进入 _ask_alert()。
         # 2) _ask_alert() 中先解析 target（若有），并做场景识别：
@@ -77,16 +156,26 @@ class AskOpsService:
         # 4) 将“场景 + incidents/events 证据”送入 SOP 引擎，输出固定结构建议文本。
         # 5) 返回 final_result 给 MCP 调用方（Cline/VS Code）。
         # 当前版本刻意不做自动修复动作，也不执行写操作，保证可控和可审计。
-        if is_alert_related_question(question):
-            return self._ask_alert(question, session_id, oem_base_url, username, password)
-
+        alert_related = is_alert_related_question(question)
         parsed = parse_intent(question, self._config.intent_metric_map)
-        if parsed.need_follow_up:
-            return AskOpsResult(
+        if parsed.need_follow_up and not alert_related:
+            return FetchDataResult(
                 session_id=session_id,
                 need_follow_up=True,
                 follow_up_question=parsed.follow_up_question,
-                final_result=None,
+                intent_type=parsed.intent_type,
+                target_name=parsed.target_name,
+                target_type_name=parsed.target_type_name,
+                time_range=parsed.time_range,
+                metric_keys=parsed.metric_keys,
+                route_key=parsed.route_key,
+                scenario=None,
+                classifier=None,
+                confidence=None,
+                latest_data=[],
+                metric_time_series=[],
+                incidents=[],
+                events=[],
             )
 
         session = self._resolve_session(
@@ -102,17 +191,23 @@ class AskOpsService:
                 endpoints=self._config.endpoints,
                 limit=200,
             )
-            table = self._format_table(
-                rows=host_rows,
-                headers=["HostName", "Status", "BootTime", "IP", "OS", "Version"],
-            )
-            return AskOpsResult(
+            return FetchDataResult(
                 session_id=session.session_id,
                 need_follow_up=False,
                 follow_up_question=None,
-                final_result=(
-                    f"当前共查询到 {len(host_rows)} 个监控主机。\n{table}"
-                ),
+                intent_type=parsed.intent_type,
+                target_name=parsed.target_name,
+                target_type_name=parsed.target_type_name,
+                time_range=parsed.time_range,
+                metric_keys=[],
+                route_key=parsed.route_key,
+                scenario=None,
+                classifier=None,
+                confidence=None,
+                latest_data=host_rows,
+                metric_time_series=[],
+                incidents=[],
+                events=[],
             )
 
         if parsed.intent_type == INTENT_METRIC_LIST and parsed.target_name:
@@ -127,16 +222,58 @@ class AskOpsService:
             if not group_names:
                 group_names = [x.get("name") for x in groups if isinstance(x.get("name"), str)]
             group_names = [x for x in group_names if x]
-            preview = group_names[:30]
-            return AskOpsResult(
+            metric_rows = [{"metricGroupName": x} for x in group_names]
+            return FetchDataResult(
                 session_id=session.session_id,
                 need_follow_up=False,
                 follow_up_question=None,
-                final_result=(
-                    f"目标 {parsed.target_name} 共查询到 {len(group_names)} 个监控项。"
-                    + (f" 监控项(前{len(preview)}个): {', '.join(preview)}" if preview else "")
-                ),
+                intent_type=parsed.intent_type,
+                target_name=parsed.target_name,
+                target_type_name=parsed.target_type_name,
+                time_range=parsed.time_range,
+                metric_keys=[],
+                route_key=parsed.route_key,
+                scenario=None,
+                classifier=None,
+                confidence=None,
+                latest_data=metric_rows,
+                metric_time_series=[],
+                incidents=[],
+                events=[],
             )
+
+        scenario = None
+        classifier = None
+        confidence: float | None = None
+        if alert_related:
+            route = classify_alert_scenario(
+                question=question,
+                alert_scenarios=self._config.alert_scenarios,
+                llm=self._llm_classifier,
+            )
+            route_cfg = self._config.alert_scenarios.get(route.scenario, {})
+            if route_cfg.get("require_target") and not parsed.target_name:
+                return FetchDataResult(
+                    session_id=session.session_id,
+                    need_follow_up=True,
+                    follow_up_question="该告警场景需要目标名称，请补充主机名（例如：host01）。",
+                    intent_type=parsed.intent_type,
+                    target_name=parsed.target_name,
+                    target_type_name=parsed.target_type_name,
+                    time_range=parsed.time_range,
+                    metric_keys=parsed.metric_keys,
+                    route_key=parsed.route_key,
+                    scenario=route.scenario,
+                    classifier=route.classifier,
+                    confidence=route.confidence,
+                    latest_data=[],
+                    metric_time_series=[],
+                    incidents=[],
+                    events=[],
+                )
+            scenario = route.scenario
+            classifier = route.classifier
+            confidence = route.confidence
 
         bundle = self._oem_client.fetch_bundle(
             session=session,
@@ -148,37 +285,42 @@ class AskOpsService:
             ),
             time_range=parsed.time_range,
         )
+        incidents = bundle.incidents
+        events = bundle.events
+        if scenario:
+            incidents = self._oem_client.list_recent_incidents(
+                session=session,
+                endpoints=self._config.endpoints,
+                target_name=parsed.target_name,
+                target_type_name=parsed.target_type_name if parsed.target_name else None,
+                scenario=scenario,
+                question=question,
+                age_hours=24,
+                limit=50,
+            )
+            events = self._oem_client.list_events_by_incidents(
+                session=session,
+                endpoints=self._config.endpoints,
+                incidents=incidents,
+            )
 
-        metric_key = parsed.metric_keys[0] if parsed.metric_keys else "unknown_metric"
-        latest_count = len(bundle.latest_data)
-        ts_count = len(bundle.metric_time_series)
-        incident_count = len(bundle.incidents)
-        event_count = len(bundle.events)
-
-        # 单文档知识库仍参与流程，但仅用于补充最终一句建议，不输出中间细节。
-        kb_tip = ""
-        try:
-            kb = SingleDocKnowledgeBase(kb_path)
-            kb_keywords = [parsed.intent_type, metric_key]
-            if parsed.target_name:
-                kb_keywords.append(parsed.target_name)
-            snippets = kb.search(kb_keywords, top_k=1)
-            if snippets:
-                kb_tip = f" 建议参考知识库: {snippets[0].source}。"
-        except Exception:
-            kb_tip = ""
-
-        final_result = (
-            f"已完成查询。目标: {parsed.target_name}，监控项: {metric_key}，时间范围: {parsed.time_range}。"
-            f" 获取到 latestData {latest_count} 条，timeSeries {ts_count} 条，incidents {incident_count} 条，events {event_count} 条。"
-            f"{kb_tip}"
-        )
-
-        return AskOpsResult(
+        return FetchDataResult(
             session_id=session.session_id,
             need_follow_up=False,
             follow_up_question=None,
-            final_result=final_result,
+            intent_type=parsed.intent_type,
+            target_name=parsed.target_name,
+            target_type_name=parsed.target_type_name,
+            time_range=parsed.time_range,
+            metric_keys=parsed.metric_keys,
+            route_key=parsed.route_key,
+            scenario=scenario,
+            classifier=classifier,
+            confidence=confidence,
+            latest_data=bundle.latest_data,
+            metric_time_series=bundle.metric_time_series,
+            incidents=incidents,
+            events=events,
         )
 
     def _ask_alert(
