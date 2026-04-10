@@ -35,9 +35,15 @@ export class AssistantOrchestrator {
     const allTools = this.mcp.getCachedTools();
     const allToolNames = allTools.map(tool => tool.name);
     const preferredToolNames = this.resolvePreferredTools(userText, options.preferredTools, allToolNames);
-    const activeTools = preferredToolNames.length > 0
+    let activeTools = preferredToolNames.length > 0
       ? allTools.filter(tool => preferredToolNames.includes(tool.name))
       : allTools;
+
+    const explicitLoginToolSelected = preferredToolNames.some(name => /oem.*login|login.*oem/i.test(name));
+    const loginIntent = this.shouldForceOemLoginFirst(userText, allToolNames);
+    if (!explicitLoginToolSelected && !loginIntent) {
+      activeTools = activeTools.filter(tool => !/oem.*login|login.*oem/i.test(tool.name));
+    }
 
     const oemPassword = await this.secrets.getOemPassword();
 
@@ -119,7 +125,7 @@ export class AssistantOrchestrator {
       this.mcp.getInstructions()
     ].filter(Boolean).join('\n\n');
 
-    const shouldForceOemLogin = this.shouldForceOemLoginFirst(userText, allToolNames);
+    const shouldForceOemLogin = loginIntent;
     const normalizedUserText = shouldForceOemLogin
       ? `${userText}\n\n请先调用 OEM 登录工具完成会话建立，然后再继续后续任务，不要重复要求用户输入 OEM 账号密码。`
       : userText;

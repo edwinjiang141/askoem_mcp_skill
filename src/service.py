@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
+import os
 from typing import Any, Optional
 
 from src.auth_session import OemSession, SessionCache
@@ -57,9 +58,9 @@ class AskOpsService:
     @staticmethod
     def _build_omr_client(config: MetricConfig) -> OmrClient | None:
         db_cfg = config.omr_db
-        username = str(db_cfg.get("username", "")).strip()
-        password = str(db_cfg.get("password", "")).strip()
-        dsn = str(db_cfg.get("dsn", "")).strip()
+        username = str(db_cfg.get("username", "")).strip() or str(os.getenv("OMR_DB_USERNAME", "")).strip()
+        password = str(db_cfg.get("password", "")).strip() or str(os.getenv("OMR_DB_PASSWORD", "")).strip()
+        dsn = str(db_cfg.get("dsn", "")).strip() or str(os.getenv("OMR_DB_DSN", "")).strip()
         schema = str(db_cfg.get("schema", "SYSMAN")).strip() or "SYSMAN"
         if not username or not password or not dsn:
             return None
@@ -438,7 +439,13 @@ class AskOpsService:
 
     def _fetch_data_from_omr(self, question: str, session_id: Optional[str] = None) -> FetchDataResult:
         if not self._omr_client:
-            raise RuntimeError("当前配置为 omr_db，但缺少 omr_db 连接配置（username/password/dsn）。")
+            self._omr_client = self._build_omr_client(self._config)
+        if not self._omr_client:
+            raise RuntimeError(
+                "当前配置为 omr_db，但缺少 omr_db 连接配置（username/password/dsn）。"
+                "请确认 config/metric_map.yaml 已生效，并在修改配置后重启 MCP 服务；"
+                "也可使用环境变量 OMR_DB_USERNAME / OMR_DB_PASSWORD / OMR_DB_DSN。"
+            )
 
         normalized_question = self._normalize_omr_question(question)
         alert_related = is_alert_related_question(normalized_question)

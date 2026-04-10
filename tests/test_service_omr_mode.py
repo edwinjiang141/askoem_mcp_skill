@@ -1,4 +1,5 @@
 import unittest
+import os
 
 from src.metric_config import MetricConfig
 from src.nl2sql_engine import SqlPlan
@@ -59,6 +60,27 @@ class TestServiceOmrMode(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["skill_name"], "builtin_query_reply")
         self.assertIn("已查询到", result["result"])
+
+    def test_build_omr_client_supports_env_fallback(self):
+        raw = {
+            "oem_api": {"endpoints": {}, "timeout_seconds": 20, "verify_ssl": False, "default_base_url": ""},
+            "intent_metric_map": {},
+            "metric_thresholds": {},
+            "grafana_links": {},
+            "alert_scenarios": {},
+            "data_source": {"mode": "omr_db"},
+            "omr_db": {"username": "", "password": "", "dsn": "", "schema": "SYSMAN"},
+        }
+        os.environ["OMR_DB_USERNAME"] = "u_env"
+        os.environ["OMR_DB_PASSWORD"] = "p_env"
+        os.environ["OMR_DB_DSN"] = "h:1521/svc"
+        try:
+            service = AskOpsService(MetricConfig(raw=raw))
+            self.assertIsNotNone(service._omr_client)
+        finally:
+            os.environ.pop("OMR_DB_USERNAME", None)
+            os.environ.pop("OMR_DB_PASSWORD", None)
+            os.environ.pop("OMR_DB_DSN", None)
 
 
 if __name__ == "__main__":
