@@ -35,6 +35,8 @@ class FetchDataResult:
     incidents: list[dict[str, Any]]
     events: list[dict[str, Any]]
     oem_errors: list[str] = None  # type: ignore[assignment]
+    generated_sql: str | None = None
+    sql_source: str | None = None  # template | llm
 
     def __post_init__(self) -> None:
         if self.oem_errors is None:
@@ -153,6 +155,8 @@ class AskOpsService:
                 "skill_name": "builtin_query_reply",
                 "result": self._build_data_reply(fetched),
                 "oem_errors": fetched.oem_errors,
+                "generated_sql": fetched.generated_sql,
+                "sql_source": fetched.sql_source,
             }
 
         # 步骤 2: 组装 OEM 数据为 Skill Engine 的 context（截断避免 token 超限）
@@ -182,6 +186,8 @@ class AskOpsService:
             "skill_name": skill_name,
             "result": result_text,
             "oem_errors": fetched.oem_errors,
+            "generated_sql": fetched.generated_sql,
+            "sql_source": fetched.sql_source,
         }
 
     @staticmethod
@@ -448,15 +454,29 @@ class AskOpsService:
             )
 
         normalized_question = self._normalize_omr_question(question)
-        alert_related = is_alert_related_question(normalized_question)
+
+        # parse_intent 仅用于提取元数据（intent_type/target_name/time_range），不做 follow_up 门禁
         parsed = parse_intent(normalized_question, self._config.intent_metric_map)
+
+        # NL2SQL 是 omr_db 模式的唯一决策者
         plan = self._nl2sql.generate(normalized_question)
         if not plan:
-            follow_up = parsed.follow_up_question or "未能生成可执行 SQL，请补充更明确的目标、指标或时间范围后重试。"
+            rejection_detail = ""
+            if self._nl2sql.last_rejection:
+                rejection_detail = (
+                    f"\nLLM 生成的 SQL 被拒绝:\n"
+                    f"  SQL: {self._nl2sql.last_rejection.sql}\n"
+                    f"  原因: {self._nl2sql.last_rejection.reason}"
+                )
             return FetchDataResult(
                 session_id=session_id,
                 need_follow_up=True,
-                follow_up_question=follow_up,
+                follow_up_question=(
+                    f"NL2SQL 未能为该问题生成可执行 SQL。{rejection_detail}\n"
+                    f"已识别意图: {parsed.intent_type or '未知'}，目标: {parsed.target_name or '未指定'}。\n"
+                    f"支持的视图: MGMT$TARGET, MGMT$INCIDENTS, SYSMAN.MGMT$METRIC_CURRENT 等。\n"
+                    f"请尝试更具体的问题，例如：'列出所有主机'、'omrd 的当前指标值'、'当前未关闭的告警有哪些'。"
+                ),
                 intent_type=parsed.intent_type,
                 target_name=parsed.target_name,
                 target_type_name=parsed.target_type_name,
@@ -472,8 +492,12 @@ class AskOpsService:
                 events=[],
             )
 
+        # 执行 SQL
         rows = self._omr_client.execute_sql(plan.sql)
+
+        # 告警场景分类（仅在问题涉及告警时）
         scenario = None
+        alert_related = is_alert_related_question(normalized_question)
         if alert_related:
             route = classify_alert_scenario(
                 question=normalized_question,
@@ -500,6 +524,8 @@ class AskOpsService:
             incidents=[],
             events=[],
             oem_errors=[],
+            generated_sql=plan.sql,
+            sql_source=plan.source,
         )
 
     # ------------------------------------------------------------------

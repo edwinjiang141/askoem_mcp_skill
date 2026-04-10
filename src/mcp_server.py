@@ -29,7 +29,7 @@ def oem_api_login(oem_base_url: str | None, username: str, password: str) -> dic
         "session_id": session_id,
         "message": "登录成功。后续请求可仅传 session_id。",
     }
-
+ 
 
 @mcp.tool()
 def fetch_data_from_oem(
@@ -97,12 +97,14 @@ def run_skill(
     password: str | None = None,
 ) -> dict[str, Any]:
     """
-    AI 诊断统一入口（认证方式与 fetch_data_from_oem 相同）：
-    - 传入 session_id（由 oem_login 返回）即可，无需重复登录
-    - 或传入 oem_base_url + username + password 自动登录
+    AI 诊断统一入口。
+
+    数据源模式（由 config/metric_map.yaml 的 data_source.mode 决定）：
+    - omr_db 模式：直连 OMR 数据库，不需要 OEM 登录，不需要传 session_id/oem_base_url/username/password，只传 question 即可
+    - rest 模式：传入 session_id（由 oem_api_login 返回），或传入 oem_base_url + username + password
 
     执行流程：
-    1) 内部调用 fetch_data 获取 OEM 结构化数据（复用已有 session）
+    1) 根据 data_source_mode 获取数据（omr_db 走 NL2SQL 直连数据库 / rest 走 OEM REST API）
     2) 通过 AI Skill Engine（SkillRouter + SkillExecutor）生成诊断
     3) 返回 LLM 生成的结构化诊断文本（结论/证据/SOP建议/下一步）
 
@@ -129,12 +131,14 @@ def health_check() -> dict[str, Any]:
         "ok": True,
         "server": "ai-gateway-mvp",
         "version": SERVER_VERSION,
-        "tools": ["health_check", "oem_login", "fetch_data_from_oem", "run_skill"],
+        "tools": ["health_check", "oem_api_login", "fetch_data_from_oem", "run_skill"],
         "config": {
+            "data_source_mode": config.data_source_mode,
             "default_base_url": config.default_base_url,
             "verify_ssl": config.verify_ssl,
         },
-        "message": "服务在线，核心工具已加载。",
+        "message": f"服务在线，数据源模式: {config.data_source_mode}。"
+                   f"{'omr_db 模式下 run_skill 无需 OEM 登录，直接传 question 即可。' if config.data_source_mode == 'omr_db' else ''}",
     }
 
 
