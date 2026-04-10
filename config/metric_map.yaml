@@ -63,7 +63,7 @@ data_source:
   mode: "omr_db"   # rest | omr_db
 
 omr_db:
-  username: "sysman"
-  password: "Edwin703"
-  dsn: "192.168.30.230:1521/repodb"
+  username: ""
+  password: ""
+  dsn: ""
   schema: "SYSMAN"

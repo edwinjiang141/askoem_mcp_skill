@@ -141,6 +141,18 @@ class AskOpsService:
                 "result": fetched.follow_up_question,
             }
 
+        # 非诊断类问题（如目标清单/监控项清单）直接返回结构化数据结果，避免无意义进入 Skill 路由。
+        if fetched.intent_type in {INTENT_TARGET_LIST, INTENT_METRIC_LIST}:
+            return {
+                "ok": True,
+                "session_id": fetched.session_id,
+                "need_follow_up": False,
+                "follow_up_question": None,
+                "skill_name": "builtin_query_reply",
+                "result": self._build_data_reply(fetched),
+                "oem_errors": fetched.oem_errors,
+            }
+
         # 步骤 2: 组装 OEM 数据为 Skill Engine 的 context（截断避免 token 超限）
         context = {
             "target_name": fetched.target_name,
@@ -180,6 +192,32 @@ class AskOpsService:
             f"timeSeries {len(fetched.metric_time_series)} 条，"
             f"incidents {len(fetched.incidents)} 条，events {len(fetched.events)} 条。"
         )
+
+    def _build_data_reply(self, fetched: FetchDataResult) -> str:
+        """清单类查询的内置结果格式化（不依赖 LLM）。"""
+        rows = fetched.latest_data or []
+        if fetched.intent_type == INTENT_TARGET_LIST:
+            normalized: list[dict[str, str]] = []
+            for r in rows[:50]:
+                normalized.append({
+                    "target_name": str(r.get("target_name", r.get("targetName", "-"))),
+                    "target_type": str(r.get("target_type", r.get("targetType", "-"))),
+                    "host_name": str(r.get("host_name", r.get("hostName", "-"))),
+                })
+            table = self._format_table(normalized, ["target_name", "target_type", "host_name"])
+            return f"已查询到 {len(rows)} 个目标：\n{table}"
+
+        if fetched.intent_type == INTENT_METRIC_LIST:
+            normalized = []
+            for r in rows[:80]:
+                normalized.append({
+                    "metric_group": str(r.get("metricGroupName", r.get("metric_name", "-"))),
+                    "metric_column": str(r.get("metricColumn", r.get("metric_column", "-"))),
+                })
+            table = self._format_table(normalized, ["metric_group", "metric_column"])
+            return f"目标 {fetched.target_name or '-'} 的监控项共 {len(rows)} 条：\n{table}"
+
+        return self._build_fallback_summary(fetched)
 
     # ------------------------------------------------------------------
     # 数据层入口（供 fetch_data_from_oem MCP tool 和 run_skill_with_llm 复用）
