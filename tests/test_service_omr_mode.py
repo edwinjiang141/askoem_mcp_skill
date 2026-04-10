@@ -6,25 +6,8 @@ from src.service import AskOpsService
 
 
 class _FakeOmrClient:
-    def list_targets(self, target_name=None, target_type=None, limit=200):
-        return [{"target_name": "host01", "target_type": "host"}]
-
-    def list_metric_groups(self, target_name, target_type="host", limit=200):
-        return [{"metricGroupName": "Load", "metricColumn": "cpuUtil"}]
-
     def execute_sql(self, sql, binds=None):
-        return [{"target_name": "host01", "value": "95"}]
-
-    def fetch_bundle(self, target_name, route_config, time_range):
-        return type("Bundle", (), {
-            "latest_data": [{"target_name": target_name, "metric_name": "Load", "metric_column": "cpuUtil", "value": "88"}],
-            "metric_time_series": [],
-            "incidents": [],
-            "events": [],
-        })()
-
-    def list_recent_incidents(self, target_name=None, target_type_name=None, age_hours=24, limit=20):
-        return [{"incident_num": "1001", "open_status": 1}]
+        return [{"target_name": "host01", "target_type": "host", "value": "95"}]
 
 
 class _FakeNl2Sql:
@@ -56,10 +39,11 @@ class TestServiceOmrMode(unittest.TestCase):
         service._nl2sql = _FakeNl2Sql()
         return service
 
-    def test_target_list_uses_omr(self):
+    def test_target_list_uses_nl2sql(self):
         service = self._build_service()
         result = service.fetch_data("列出主机清单")
         self.assertFalse(result.need_follow_up)
+        self.assertEqual(result.classifier, "nl2sql_template")
         self.assertEqual(result.latest_data[0]["target_name"], "host01")
 
     def test_need_followup_triggers_nl2sql(self):

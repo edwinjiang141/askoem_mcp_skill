@@ -21,6 +21,11 @@ class TestNl2SqlEngine(unittest.TestCase):
         self.assertFalse(self.engine._is_safe_sql("delete from mgmt$target"))
         self.assertFalse(self.engine._is_safe_sql("select * from dual;"))
 
+    def test_template_metric_list_with_tool_prefix(self):
+        plan = self.engine.generate("@fetch_data_from_oem 查看 omedb 的监控项有哪些")
+        self.assertIsNotNone(plan)
+        self.assertIn("from sysman.mgmt$metric_current", plan.sql.lower())
+
 
 if __name__ == "__main__":
     unittest.main()
