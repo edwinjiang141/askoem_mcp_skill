@@ -62,12 +62,26 @@ class OemNl2SqlEngine:
 
     @staticmethod
     def _template_sql(question: str) -> Optional[str]:
-        q = question.lower()
+        normalized = re.sub(r"@[A-Za-z0-9_:-]+\s*", "", question).strip()
+        q = normalized.lower()
         if any(k in q for k in ["列出", "list", "目标", "targets"]) and any(k in q for k in ["主机", "host", "database", "数据库"]):
             return (
                 "SELECT target_name, target_type, display_name, host_name, last_load_time_utc "
                 "FROM mgmt$target ORDER BY last_load_time_utc DESC NULLS LAST FETCH FIRST 200 ROWS ONLY"
             )
+
+        if any(k in q for k in ["监控项", "监控指标", "metric", "metrics"]) and any(
+            k in q for k in ["查看", "列出", "有哪些", "清单", "列表"]
+        ):
+            target_match = re.search(r"(?:查看|列出)?\s*([A-Za-z0-9._-]{2,})\s*(?:的)?\s*(?:监控项|监控指标|metrics?)", normalized, re.IGNORECASE)
+            target_name = target_match.group(1) if target_match else None
+            if target_name:
+                return (
+                    "SELECT DISTINCT target_name, target_type, metric_name, metric_column, metric_label, column_label "
+                    "FROM sysman.mgmt$metric_current "
+                    f"WHERE LOWER(target_name)=LOWER('{target_name}') "
+                    "ORDER BY metric_name, metric_column FETCH FIRST 300 ROWS ONLY"
+                )
 
         if any(k in q for k in ["告警", "incident", "事件"]) and any(k in q for k in ["未关闭", "open", "当前", "current"]):
             return (
