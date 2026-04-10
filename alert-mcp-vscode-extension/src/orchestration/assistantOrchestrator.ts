@@ -349,11 +349,12 @@ export class AssistantOrchestrator {
   }
 
   private buildDefaultToolArgs(userText: string, chainContext: Record<string, unknown>): Record<string, unknown> {
+    const normalizedText = userText.replace(/@[a-zA-Z0-9_:-]+\s*/g, '').trim() || userText;
     return {
-      query: userText,
-      question: userText,
-      input: userText,
-      text: userText,
+      query: normalizedText,
+      question: normalizedText,
+      input: normalizedText,
+      text: normalizedText,
       ...chainContext
     };
   }

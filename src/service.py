@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any, Optional
 
 from src.auth_session import OemSession, SessionCache
@@ -439,81 +440,16 @@ class AskOpsService:
         if not self._omr_client:
             raise RuntimeError("当前配置为 omr_db，但缺少 omr_db 连接配置（username/password/dsn）。")
 
-        alert_related = is_alert_related_question(question)
-        parsed = parse_intent(question, self._config.intent_metric_map)
-
-        if parsed.intent_type == INTENT_TARGET_LIST:
-            host_rows = self._omr_client.list_targets(target_name=parsed.target_name, target_type=parsed.target_type_name, limit=200)
+        normalized_question = self._normalize_omr_question(question)
+        alert_related = is_alert_related_question(normalized_question)
+        parsed = parse_intent(normalized_question, self._config.intent_metric_map)
+        plan = self._nl2sql.generate(normalized_question)
+        if not plan:
+            follow_up = parsed.follow_up_question or "未能生成可执行 SQL，请补充更明确的目标、指标或时间范围后重试。"
             return FetchDataResult(
                 session_id=session_id,
-                need_follow_up=False,
-                follow_up_question=None,
-                intent_type=parsed.intent_type,
-                target_name=parsed.target_name,
-                target_type_name=parsed.target_type_name,
-                time_range=parsed.time_range,
-                metric_keys=[],
-                route_key=parsed.route_key,
-                scenario=None,
-                classifier=None,
-                confidence=None,
-                latest_data=host_rows,
-                metric_time_series=[],
-                incidents=[],
-                events=[],
-            )
-
-        if parsed.intent_type == INTENT_METRIC_LIST and parsed.target_name:
-            metrics = self._omr_client.list_metric_groups(
-                target_name=parsed.target_name,
-                target_type=parsed.target_type_name,
-                limit=200,
-            )
-            return FetchDataResult(
-                session_id=session_id,
-                need_follow_up=False,
-                follow_up_question=None,
-                intent_type=parsed.intent_type,
-                target_name=parsed.target_name,
-                target_type_name=parsed.target_type_name,
-                time_range=parsed.time_range,
-                metric_keys=[],
-                route_key=parsed.route_key,
-                scenario=None,
-                classifier=None,
-                confidence=None,
-                latest_data=metrics,
-                metric_time_series=[],
-                incidents=[],
-                events=[],
-            )
-
-        if parsed.need_follow_up:
-            plan = self._nl2sql.generate(question)
-            if not plan:
-                return FetchDataResult(
-                    session_id=session_id,
-                    need_follow_up=True,
-                    follow_up_question=parsed.follow_up_question,
-                    intent_type=parsed.intent_type,
-                    target_name=parsed.target_name,
-                    target_type_name=parsed.target_type_name,
-                    time_range=parsed.time_range,
-                    metric_keys=parsed.metric_keys,
-                    route_key=parsed.route_key,
-                    scenario=None,
-                    classifier=None,
-                    confidence=None,
-                    latest_data=[],
-                    metric_time_series=[],
-                    incidents=[],
-                    events=[],
-                )
-            rows = self._omr_client.execute_sql(plan.sql)
-            return FetchDataResult(
-                session_id=session_id,
-                need_follow_up=False,
-                follow_up_question=None,
+                need_follow_up=True,
+                follow_up_question=follow_up,
                 intent_type=parsed.intent_type,
                 target_name=parsed.target_name,
                 target_type_name=parsed.target_type_name,
@@ -521,43 +457,23 @@ class AskOpsService:
                 metric_keys=parsed.metric_keys,
                 route_key=parsed.route_key,
                 scenario=None,
-                classifier=f"nl2sql_{plan.source}",
-                confidence=0.8 if plan.source == "template" else 0.7,
-                latest_data=rows,
+                classifier=None,
+                confidence=None,
+                latest_data=[],
                 metric_time_series=[],
                 incidents=[],
                 events=[],
             )
 
+        rows = self._omr_client.execute_sql(plan.sql)
         scenario = None
-        classifier = None
-        confidence: float | None = None
         if alert_related:
             route = classify_alert_scenario(
-                question=question,
+                question=normalized_question,
                 alert_scenarios=self._config.alert_scenarios,
                 llm=self._llm_classifier,
             )
             scenario = route.scenario
-            classifier = route.classifier
-            confidence = route.confidence
-
-        bundle = self._omr_client.fetch_bundle(
-            target_name=parsed.target_name,
-            route_config=self._merge_route_target_type(
-                self._config.intent_metric_map.get(parsed.route_key or "", {}),
-                parsed.target_type_name,
-            ),
-            time_range=parsed.time_range,
-        )
-        incidents = bundle.incidents
-        if scenario and not incidents:
-            incidents = self._omr_client.list_recent_incidents(
-                target_name=parsed.target_name,
-                target_type_name=parsed.target_type_name if parsed.target_name else None,
-                age_hours=24,
-                limit=20,
-            )
 
         return FetchDataResult(
             session_id=session_id,
@@ -570,11 +486,11 @@ class AskOpsService:
             metric_keys=parsed.metric_keys,
             route_key=parsed.route_key,
             scenario=scenario,
-            classifier=classifier,
-            confidence=confidence,
-            latest_data=bundle.latest_data,
-            metric_time_series=bundle.metric_time_series,
-            incidents=incidents,
+            classifier=f"nl2sql_{plan.source}",
+            confidence=0.8 if plan.source == "template" else 0.7,
+            latest_data=rows,
+            metric_time_series=[],
+            incidents=[],
             events=[],
             oem_errors=[],
         )
@@ -607,6 +523,11 @@ class AskOpsService:
         dash_line = fmt_line(["-" * len(h) for h in headers])
         row_lines = [fmt_line([str(r.get(h, "-")) for h in headers]) for r in rows]
         return "\n".join([header_line, dash_line, *row_lines])
+
+    @staticmethod
+    def _normalize_omr_question(question: str) -> str:
+        cleaned = re.sub(r"@[A-Za-z0-9_:-]+\s*", "", question).strip()
+        return cleaned or question.strip()
 
     def _resolve_session(
         self,

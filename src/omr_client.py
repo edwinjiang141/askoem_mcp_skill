@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any, Optional
 
 from src.oem_client import OemDataBundle
@@ -40,9 +41,20 @@ class OmrClient:
                 columns = [str(d[0]).lower() for d in (cur.description or [])]
                 rows: list[dict[str, Any]] = []
                 for r in cur.fetchall():
-                    row = {columns[i]: r[i] for i in range(len(columns))}
+                    row = {columns[i]: self._normalize_value(r[i]) for i in range(len(columns))}
                     rows.append(row)
                 return rows
+
+    @staticmethod
+    def _normalize_value(value: Any) -> Any:
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            raw = bytes(value)
+            return raw.hex()
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if isinstance(value, Decimal):
+            return float(value)
+        return value
 
     def execute_sql(self, sql: str, binds: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
         return self._query(sql, binds)
