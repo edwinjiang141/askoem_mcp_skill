@@ -43,6 +43,14 @@ class MetricConfig:
     def alert_scenarios(self) -> dict[str, Any]:
         return self.raw.get("alert_scenarios", {})
 
+    @property
+    def data_source_mode(self) -> str:
+        return str(self.raw.get("data_source", {}).get("mode", "rest")).strip().lower()
+
+    @property
+    def omr_db(self) -> dict[str, Any]:
+        return dict(self.raw.get("omr_db", {}))
+
 
 def load_metric_config(path: str) -> MetricConfig:
     full_path = Path(path)

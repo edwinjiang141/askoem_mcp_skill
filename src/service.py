@@ -8,6 +8,8 @@ from src.alert_router import classify_alert_scenario
 from src.intent_parser import INTENT_METRIC_LIST, INTENT_TARGET_LIST, is_alert_related_question, parse_intent
 from src.llm_classifier import LlmIntentClassifier
 from src.metric_config import MetricConfig
+from src.nl2sql_engine import OemNl2SqlEngine
+from src.omr_client import OmrClient, OmrConfig
 from src.oem_client import OemClient, OemDataBundle
 from src.skill_engine import AgentSkillsEngine
 
@@ -48,6 +50,19 @@ class AskOpsService:
         self._llm_classifier = LlmIntentClassifier(timeout_seconds=min(config.timeout_seconds, 15))
         # AI Skill Engine: 启动时扫描 skills/ 目录，预加载所有 SKILL.md 元信息
         self._skill_engine = AgentSkillsEngine()
+        self._nl2sql = OemNl2SqlEngine()
+        self._omr_client = self._build_omr_client(config)
+
+    @staticmethod
+    def _build_omr_client(config: MetricConfig) -> OmrClient | None:
+        db_cfg = config.omr_db
+        username = str(db_cfg.get("username", "")).strip()
+        password = str(db_cfg.get("password", "")).strip()
+        dsn = str(db_cfg.get("dsn", "")).strip()
+        schema = str(db_cfg.get("schema", "SYSMAN")).strip() or "SYSMAN"
+        if not username or not password or not dsn:
+            return None
+        return OmrClient(OmrConfig(username=username, password=password, dsn=dsn, schema=schema))
 
     def login(self, oem_base_url: str, username: str, password: str) -> str:
         """
@@ -188,6 +203,9 @@ class AskOpsService:
 
         不做 Skill 渲染；Skill 由 run_skill_with_llm() 触发。
         """
+        if self._config.data_source_mode == "omr_db":
+            return self._fetch_data_from_omr(question=question, session_id=session_id)
+
         alert_related = is_alert_related_question(question)
         parsed = parse_intent(question, self._config.intent_metric_map)
         if parsed.need_follow_up and not alert_related:
@@ -377,6 +395,150 @@ class AskOpsService:
             incidents=incidents,
             events=events,
             oem_errors=oem_errors,
+        )
+
+    def _fetch_data_from_omr(self, question: str, session_id: Optional[str] = None) -> FetchDataResult:
+        if not self._omr_client:
+            raise RuntimeError("当前配置为 omr_db，但缺少 omr_db 连接配置（username/password/dsn）。")
+
+        alert_related = is_alert_related_question(question)
+        parsed = parse_intent(question, self._config.intent_metric_map)
+
+        if parsed.intent_type == INTENT_TARGET_LIST:
+            host_rows = self._omr_client.list_targets(target_name=parsed.target_name, target_type=parsed.target_type_name, limit=200)
+            return FetchDataResult(
+                session_id=session_id,
+                need_follow_up=False,
+                follow_up_question=None,
+                intent_type=parsed.intent_type,
+                target_name=parsed.target_name,
+                target_type_name=parsed.target_type_name,
+                time_range=parsed.time_range,
+                metric_keys=[],
+                route_key=parsed.route_key,
+                scenario=None,
+                classifier=None,
+                confidence=None,
+                latest_data=host_rows,
+                metric_time_series=[],
+                incidents=[],
+                events=[],
+            )
+
+        if parsed.intent_type == INTENT_METRIC_LIST and parsed.target_name:
+            metrics = self._omr_client.list_metric_groups(
+                target_name=parsed.target_name,
+                target_type=parsed.target_type_name,
+                limit=200,
+            )
+            return FetchDataResult(
+                session_id=session_id,
+                need_follow_up=False,
+                follow_up_question=None,
+                intent_type=parsed.intent_type,
+                target_name=parsed.target_name,
+                target_type_name=parsed.target_type_name,
+                time_range=parsed.time_range,
+                metric_keys=[],
+                route_key=parsed.route_key,
+                scenario=None,
+                classifier=None,
+                confidence=None,
+                latest_data=metrics,
+                metric_time_series=[],
+                incidents=[],
+                events=[],
+            )
+
+        if parsed.need_follow_up:
+            plan = self._nl2sql.generate(question)
+            if not plan:
+                return FetchDataResult(
+                    session_id=session_id,
+                    need_follow_up=True,
+                    follow_up_question=parsed.follow_up_question,
+                    intent_type=parsed.intent_type,
+                    target_name=parsed.target_name,
+                    target_type_name=parsed.target_type_name,
+                    time_range=parsed.time_range,
+                    metric_keys=parsed.metric_keys,
+                    route_key=parsed.route_key,
+                    scenario=None,
+                    classifier=None,
+                    confidence=None,
+                    latest_data=[],
+                    metric_time_series=[],
+                    incidents=[],
+                    events=[],
+                )
+            rows = self._omr_client.execute_sql(plan.sql)
+            return FetchDataResult(
+                session_id=session_id,
+                need_follow_up=False,
+                follow_up_question=None,
+                intent_type=parsed.intent_type,
+                target_name=parsed.target_name,
+                target_type_name=parsed.target_type_name,
+                time_range=parsed.time_range,
+                metric_keys=parsed.metric_keys,
+                route_key=parsed.route_key,
+                scenario=None,
+                classifier=f"nl2sql_{plan.source}",
+                confidence=0.8 if plan.source == "template" else 0.7,
+                latest_data=rows,
+                metric_time_series=[],
+                incidents=[],
+                events=[],
+            )
+
+        scenario = None
+        classifier = None
+        confidence: float | None = None
+        if alert_related:
+            route = classify_alert_scenario(
+                question=question,
+                alert_scenarios=self._config.alert_scenarios,
+                llm=self._llm_classifier,
+            )
+            scenario = route.scenario
+            classifier = route.classifier
+            confidence = route.confidence
+
+        bundle = self._omr_client.fetch_bundle(
+            target_name=parsed.target_name,
+            route_config=self._merge_route_target_type(
+                self._config.intent_metric_map.get(parsed.route_key or "", {}),
+                parsed.target_type_name,
+            ),
+            time_range=parsed.time_range,
+        )
+        incidents = bundle.incidents
+        if scenario and not incidents:
+            incidents = self._omr_client.list_recent_incidents(
+                target_name=parsed.target_name,
+                target_type_name=parsed.target_type_name if parsed.target_name else None,
+                age_hours=24,
+                limit=20,
+            )
+
+        return FetchDataResult(
+            session_id=session_id,
+            need_follow_up=False,
+            follow_up_question=None,
+            intent_type=parsed.intent_type,
+            target_name=parsed.target_name,
+            target_type_name=parsed.target_type_name,
+            time_range=parsed.time_range,
+            metric_keys=parsed.metric_keys,
+            route_key=parsed.route_key,
+            scenario=scenario,
+            classifier=classifier,
+            confidence=confidence,
+            latest_data=bundle.latest_data,
+            metric_time_series=bundle.metric_time_series,
+            incidents=incidents,
+            events=[],
+            oem_errors=[],
         )
 
     # ------------------------------------------------------------------
