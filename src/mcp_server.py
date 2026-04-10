@@ -18,7 +18,7 @@ mcp = FastMCP("ai-gateway-mvp")
 
 
 @mcp.tool()
-def oem_login(oem_base_url: str | None, username: str, password: str) -> dict[str, Any]:
+def oem_api_login(oem_base_url: str | None, username: str, password: str) -> dict[str, Any]:
     """
     使用 OEM 账号登录并创建会话缓存。
     返回 session_id，后续请求直接复用。
