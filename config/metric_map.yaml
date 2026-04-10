@@ -57,3 +57,13 @@ alert_scenarios:
   hardware_hba_disk:
     keywords: ["hba", "disk", "硬件", "磁盘故障", "硬盘"]
     require_target: false
+
+
+data_source:
+  mode: "omr_db"   # rest | omr_db
+
+omr_db:
+  username: ""
+  password: ""
+  dsn: ""
+  schema: "SYSMAN"
