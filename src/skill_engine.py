@@ -39,6 +39,7 @@ class SkillMetadata:
     description: str
     file_path: str
     full_content: str
+    references: Dict[str, str]  # 文件名 -> 内容，来自 references/ 目录
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +89,21 @@ class SkillRegistry:
         for f in self.skills_dir.glob("*.skill"):
             self._parse_and_register(f)
 
+    @staticmethod
+    def _load_references(skill_dir: Path) -> Dict[str, str]:
+        """加载 skill_dir/references/ 下所有 .md 文件内容，返回 {文件名: 内容}。"""
+        refs_dir = skill_dir / "references"
+        if not refs_dir.is_dir():
+            return {}
+        result: Dict[str, str] = {}
+        for f in sorted(refs_dir.iterdir()):
+            if f.is_file() and f.suffix in (".md", ".txt"):
+                try:
+                    result[f.name] = f.read_text(encoding="utf-8")
+                except Exception:
+                    pass
+        return result
+
     def _parse_and_register(self, file_path: Path):
         """解析单个 SKILL.md 的 YAML frontmatter，提取 name 和 description。"""
         try:
@@ -112,11 +128,14 @@ class SkillRegistry:
         name = name_m.group(1).strip()
         description = desc_m.group(1).strip().replace("\n", " ") if desc_m else ""
 
+        refs = self._load_references(file_path.parent)
+
         self.skills[name] = SkillMetadata(
             name=name,
             description=description,
             file_path=str(file_path),
             full_content=content,
+            references=refs,
         )
 
 
@@ -203,10 +222,16 @@ class SkillExecutor:
         if not skill:
             return f"错误: Skill '{skill_name}' 不存在"
 
+        import json
+
         context_info = ""
         if context:
-            import json
             context_info = f"OEM 监控数据（作为诊断证据）：\n{json.dumps(context, ensure_ascii=False, indent=2)}"
+
+        # OEM 数据不足时加载 references 作为补充知识
+        if skill.references and self._is_oem_data_insufficient(context):
+            refs_text = self._format_references(skill.references)
+            context_info += f"\n\n---\n\n参考文档（OEM 数据不足，请基于以下参考文档生成 SOP 建议）：\n{refs_text}"
 
         try:
             return self._chain.invoke({
@@ -216,6 +241,24 @@ class SkillExecutor:
             })
         except Exception as e:
             return f"错误: 执行 Skill 时 LLM 调用失败: {e}"
+
+    @staticmethod
+    def _is_oem_data_insufficient(context: Optional[dict]) -> bool:
+        """OEM 取数存在错误，或 incidents/events/latestData/timeSeries 全部为空。"""
+        if not context:
+            return True
+        if context.get("oem_errors"):
+            return True
+        data_fields = ("incidents", "events", "latest_data", "metric_time_series")
+        return all(len(context.get(f, [])) == 0 for f in data_fields)
+
+    @staticmethod
+    def _format_references(refs: Dict[str, str]) -> str:
+        """将 references dict 格式化为 LLM 可读文本。"""
+        parts: List[str] = []
+        for filename, content in refs.items():
+            parts.append(f"### {filename}\n{content.strip()}")
+        return "\n\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
