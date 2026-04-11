@@ -191,10 +191,11 @@ export class AssistantOrchestrator {
 
         const toolResult = await this.mcp.callTool(toolName, resolvedArgs);
         const redactedToolResult = this.redactSensitiveText(toolResult);
+        const toolResultDisplay = this.redactSensitiveText(this.formatToolResultForDisplay(toolResult));
         steps.push({
           type: 'tool-result',
           title: `Tool result: ${toolName}`,
-          detail: redactedToolResult
+          detail: toolResultDisplay
         });
 
         if (toolName === 'ask_ops' && this.indicatesNoSop(toolResult)) {
@@ -327,7 +328,7 @@ export class AssistantOrchestrator {
         };
       }
 
-      const safeResult = this.redactSensitiveText(lastResult);
+      const safeResult = this.redactSensitiveText(this.formatToolResultForDisplay(lastResult));
       steps.push({
         type: 'tool-result',
         title: `Tool result: ${toolName}`,
@@ -348,8 +349,9 @@ export class AssistantOrchestrator {
       }
     }
 
+    const chainFinal = this.formatToolResultForDisplay(lastResult || '').trim() || lastResult || '已按顺序完成所有 @ 工具调用。';
     return {
-      finalText: this.redactSensitiveText(lastResult || '已按顺序完成所有 @ 工具调用。'),
+      finalText: this.redactSensitiveText(chainFinal),
       steps
     };
   }
@@ -526,7 +528,7 @@ export class AssistantOrchestrator {
         {
           type: 'tool-result',
           title: `Tool result: ${loginToolName}`,
-          detail: this.redactSensitiveText(toolResult)
+          detail: this.redactSensitiveText(this.formatToolResultForDisplay(toolResult))
         }
       ]
     };
@@ -564,6 +566,25 @@ export class AssistantOrchestrator {
     }
 
     return updated;
+  }
+
+  /**
+   * MCP 工具若返回 JSON 且含 report 字段，优先展示纯文本报告（含 SQL 执行追踪），避免整段 JSON 难读。
+   */
+  private formatToolResultForDisplay(raw: string): string {
+    const trimmed = raw.trim();
+    if (!trimmed.startsWith('{')) {
+      return raw;
+    }
+    try {
+      const obj = JSON.parse(trimmed) as Record<string, unknown>;
+      if (typeof obj.report === 'string' && obj.report.trim().length > 0) {
+        return obj.report.trim();
+      }
+    } catch {
+      // keep raw
+    }
+    return raw;
   }
 
   private redactSensitiveText(input: string): string {

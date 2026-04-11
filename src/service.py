@@ -7,7 +7,7 @@ from typing import Any, Optional
 
 from src.auth_session import OemSession, SessionCache
 from src.alert_router import classify_alert_scenario
-from src.intent_parser import INTENT_METRIC_LIST, INTENT_TARGET_LIST, is_alert_related_question, parse_intent
+from src.intent_parser import INTENT_METRIC_LIST, INTENT_SINGLE_DIAGNOSIS, INTENT_TARGET_LIST, is_alert_related_question, parse_intent
 from src.llm_classifier import LlmIntentClassifier
 from src.metric_config import MetricConfig
 from src.nl2sql_engine import OemNl2SqlEngine
@@ -126,38 +126,74 @@ class AskOpsService:
                 password=password,
             )
         except (ValueError, RuntimeError) as e:
-            return {
-                "ok": False,
-                "session_id": session_id,
-                "need_follow_up": False,
-                "follow_up_question": None,
-                "skill_name": None,
-                "result": str(e),
-            }
+            return self._finalize_run_skill_result(
+                {
+                    "ok": False,
+                    "session_id": session_id,
+                    "need_follow_up": False,
+                    "follow_up_question": None,
+                    "skill_name": None,
+                    "result": str(e),
+                    "oem_errors": [],
+                    "generated_sql": None,
+                    "sql_source": None,
+                },
+                question,
+            )
 
         if fetched.need_follow_up:
-            return {
-                "ok": False,
-                "session_id": fetched.session_id,
-                "need_follow_up": True,
-                "follow_up_question": fetched.follow_up_question,
-                "skill_name": None,
-                "result": fetched.follow_up_question,
-            }
+            return self._finalize_run_skill_result(
+                {
+                    "ok": False,
+                    "session_id": fetched.session_id,
+                    "need_follow_up": True,
+                    "follow_up_question": fetched.follow_up_question,
+                    "skill_name": None,
+                    "result": fetched.follow_up_question,
+                    "oem_errors": fetched.oem_errors,
+                    "generated_sql": fetched.generated_sql,
+                    "sql_source": fetched.sql_source,
+                },
+                question,
+            )
 
         # 非诊断类问题（如目标清单/监控项清单）直接返回结构化数据结果，避免无意义进入 Skill 路由。
         if fetched.intent_type in {INTENT_TARGET_LIST, INTENT_METRIC_LIST}:
-            return {
-                "ok": True,
-                "session_id": fetched.session_id,
-                "need_follow_up": False,
-                "follow_up_question": None,
-                "skill_name": "builtin_query_reply",
-                "result": self._build_data_reply(fetched),
-                "oem_errors": fetched.oem_errors,
-                "generated_sql": fetched.generated_sql,
-                "sql_source": fetched.sql_source,
-            }
+            return self._finalize_run_skill_result(
+                {
+                    "ok": True,
+                    "session_id": fetched.session_id,
+                    "need_follow_up": False,
+                    "follow_up_question": None,
+                    "skill_name": "builtin_query_reply",
+                    "result": self._build_data_reply(fetched),
+                    "oem_errors": fetched.oem_errors,
+                    "generated_sql": fetched.generated_sql,
+                    "sql_source": fetched.sql_source,
+                },
+                question,
+            )
+
+        # omr_db 通用数据查询：有数据行且不是诊断类意图 → 直接格式化为文本表格返回
+        if (
+            self._config.data_source_mode == "omr_db"
+            and fetched.latest_data
+            and fetched.intent_type not in {INTENT_SINGLE_DIAGNOSIS, INTENT_TARGET_LIST, INTENT_METRIC_LIST}
+        ):
+            return self._finalize_run_skill_result(
+                {
+                    "ok": True,
+                    "session_id": fetched.session_id,
+                    "need_follow_up": False,
+                    "follow_up_question": None,
+                    "skill_name": "builtin_query_reply",
+                    "result": self._build_data_reply(fetched),
+                    "oem_errors": fetched.oem_errors,
+                    "generated_sql": fetched.generated_sql,
+                    "sql_source": fetched.sql_source,
+                },
+                question,
+            )
 
         # 步骤 2: 组装 OEM 数据为 Skill Engine 的 context（截断避免 token 超限）
         context = {
@@ -178,17 +214,125 @@ class AskOpsService:
         if skill_name is None:
             result_text = self._build_fallback_summary(fetched)
 
-        return {
-            "ok": True,
-            "session_id": fetched.session_id,
-            "need_follow_up": False,
-            "follow_up_question": None,
-            "skill_name": skill_name,
-            "result": result_text,
-            "oem_errors": fetched.oem_errors,
-            "generated_sql": fetched.generated_sql,
-            "sql_source": fetched.sql_source,
-        }
+        return self._finalize_run_skill_result(
+            {
+                "ok": True,
+                "session_id": fetched.session_id,
+                "need_follow_up": False,
+                "follow_up_question": None,
+                "skill_name": skill_name,
+                "result": result_text,
+                "oem_errors": fetched.oem_errors,
+                "generated_sql": fetched.generated_sql,
+                "sql_source": fetched.sql_source,
+            },
+            question,
+        )
+
+    def _finalize_run_skill_result(self, out: dict[str, Any], question: str) -> dict[str, Any]:
+        """为 MCP 工具追加固定版式的 report 字段（纯文本，便于 trace 阅读）。"""
+        out["report"] = self.build_run_skill_tool_report(out, question)
+        return out
+
+    def build_run_skill_tool_report(self, result: dict[str, Any], question: str) -> str:
+        """run_skill 工具的人类可读报告：含 SQL 执行追踪与诊断正文。"""
+        lines: list[str] = []
+        lines.append("=== run_skill 诊断报告 ===")
+        lines.append("")
+        lines.append("【问题】")
+        lines.append(question.strip())
+        lines.append("")
+        lines.append("【SQL 执行追踪】")
+        sql = result.get("generated_sql")
+        src = result.get("sql_source")
+        if sql:
+            lines.append(f"来源: {src or 'unknown'}")
+            lines.append("SQL:")
+            lines.append(str(sql))
+        else:
+            lines.append("（未生成 NL2SQL：数据源为 REST 或非 omr_db 路径）")
+        lines.append("")
+        lines.append("【状态】")
+        if result.get("ok") is False:
+            lines.append("失败" + ("（需要追问）" if result.get("need_follow_up") else ""))
+        else:
+            lines.append("成功")
+        lines.append("")
+        lines.append("【诊断结果】")
+        lines.append(str(result.get("result", "")))
+        oem_errors = result.get("oem_errors") or []
+        if oem_errors:
+            lines.append("")
+            lines.append("【OEM 数据层异常】")
+            for i, err in enumerate(oem_errors, 1):
+                lines.append(f"{i}. {err}")
+        lines.append("")
+        lines.append("【元信息】")
+        lines.append(f"skill_name: {result.get('skill_name')}")
+        lines.append(f"session_id: {result.get('session_id') or '-'}")
+        return "\n".join(lines)
+
+    def build_fetch_tool_report(self, fetched: FetchDataResult, question: str) -> str:
+        """fetch_data_from_oem 工具的人类可读报告：含 SQL 执行追踪与数据表格。"""
+        lines: list[str] = []
+        lines.append("=== fetch_data_from_oem 执行报告 ===")
+        lines.append("")
+        lines.append("【问题】")
+        lines.append(question.strip())
+        lines.append("")
+        lines.append("【SQL 执行追踪】")
+        if fetched.generated_sql:
+            lines.append(f"来源: {fetched.sql_source or 'unknown'}")
+            lines.append("SQL:")
+            lines.append(fetched.generated_sql)
+        else:
+            lines.append("（未生成 NL2SQL：数据源为 REST 或非 omr_db 路径）")
+        lines.append("")
+        lines.append("【状态】")
+        lines.append("需要追问" if fetched.need_follow_up else "成功")
+        lines.append("")
+        lines.append("【意图摘要】")
+        lines.append(
+            f"intent_type={fetched.intent_type or '-'} | "
+            f"target={fetched.target_name or '-'} | "
+            f"scenario={fetched.scenario or '-'} | "
+            f"time_range={fetched.time_range or '-'}"
+        )
+        if fetched.oem_errors:
+            lines.append("")
+            lines.append("【OEM 层异常】")
+            for i, err in enumerate(fetched.oem_errors, 1):
+                lines.append(f"{i}. {err}")
+        lines.append("")
+        if fetched.need_follow_up:
+            lines.append("【说明】")
+            lines.append(fetched.follow_up_question or "")
+        else:
+            lines.append("【数据】")
+            data_text = self._build_data_reply(fetched)
+            if data_text == "未查询到数据。" and (fetched.incidents or fetched.events):
+                data_text = self._format_incidents_events_snippet(fetched)
+            lines.append(data_text)
+        lines.append("")
+        lines.append("【元信息】")
+        lines.append(f"session_id: {fetched.session_id or '-'}")
+        return "\n".join(lines)
+
+    def _format_incidents_events_snippet(self, fetched: FetchDataResult) -> str:
+        """latest_data 为空但存在 incidents/events 时的简短文本表。"""
+        parts: list[str] = []
+        if fetched.incidents:
+            rows: list[dict[str, str]] = []
+            for r in fetched.incidents[:20]:
+                rows.append({
+                    "num": str(r.get("incidentNum", r.get("incident_num", "-"))),
+                    "summary": str(r.get("summaryMsg", r.get("summary_msg", "-"))),
+                    "severity": str(r.get("severity", "-")),
+                })
+            parts.append("incidents（前20条）:\n" + self._format_table(rows, ["num", "summary", "severity"]))
+        if fetched.events:
+            parts.append(f"events 条数: {len(fetched.events)}（未逐条展开）")
+        return "\n\n".join(parts) if parts else "未查询到数据。"
 
     @staticmethod
     def _build_fallback_summary(fetched: FetchDataResult) -> str:
@@ -201,9 +345,26 @@ class AskOpsService:
             f"incidents {len(fetched.incidents)} 条，events {len(fetched.events)} 条。"
         )
 
+    def _build_sql_result_table_text(self, rows: list[dict[str, Any]]) -> str:
+        """按查询返回的行字典原列输出表格（NL2SQL / 通用结果）。"""
+        if not rows:
+            return "未查询到数据。"
+        slice_rows = rows[:50]
+        headers = AskOpsService._union_keys_in_order(slice_rows)
+        display_rows: list[dict[str, str]] = []
+        for r in slice_rows:
+            display_rows.append({h: str(r.get(h, "-")) for h in headers})
+        table = self._format_table(display_rows, headers)
+        return f"查询结果（共 {len(rows)} 行，显示前 {min(len(rows), 50)} 行）：\n{table}"
+
     def _build_data_reply(self, fetched: FetchDataResult) -> str:
-        """清单类查询的内置结果格式化（不依赖 LLM）。"""
+        """查询结果格式化：统一输出可读文本表格（不依赖 LLM）。"""
         rows = fetched.latest_data or []
+
+        # OMR NL2SQL 已执行：必须按 SQL 结果列展示，不能被 intent 误判成「目标清单」等模板覆盖
+        if fetched.generated_sql:
+            return self._build_sql_result_table_text(rows)
+
         if fetched.intent_type == INTENT_TARGET_LIST:
             normalized: list[dict[str, str]] = []
             for r in rows[:50]:
@@ -225,7 +386,151 @@ class AskOpsService:
             table = self._format_table(normalized, ["metric_group", "metric_column"])
             return f"目标 {fetched.target_name or '-'} 的监控项共 {len(rows)} 条：\n{table}"
 
-        return self._build_fallback_summary(fetched)
+        # 通用查询结果（REST 等，无 NL2SQL）：合并所有行的键作为列名
+        return self._build_sql_result_table_text(rows)
+
+    # ------------------------------------------------------------------
+    # execute_omr_sql（供 MCP tool 直接执行用户 SQL，仅 omr_db + 与 NL2SQL 相同的安全策略）
+    # ------------------------------------------------------------------
+
+    _MAX_EXECUTE_OMR_SQL_ROWS = 500
+
+    def execute_omr_sql(self, sql: str, session_id: Optional[str] = None) -> dict[str, Any]:
+        """
+        在 OMR 上执行用户提交的只读 SQL，返回与 fetch_data_from_oem 成功时一致的字典结构。
+
+        输入: sql（单条 SELECT），session_id（可选，仅回显）
+        处理: 与 NL2SQL 相同的安全检查 -> OmrClient.execute_sql
+        输出: ok / data / report / generated_sql / sql_source=user
+        失败: ok False + result + report
+        """
+        sql_stripped = (sql or "").strip()
+        if not sql_stripped:
+            return {
+                "ok": False,
+                "session_id": session_id,
+                "generated_sql": None,
+                "sql_source": "user",
+                "result": "SQL 不能为空。",
+                "report": "=== execute_omr_sql 执行报告 ===\n\n【错误】\nSQL 不能为空。\n",
+            }
+
+        if self._config.data_source_mode != "omr_db":
+            return {
+                "ok": False,
+                "session_id": session_id,
+                "generated_sql": sql_stripped,
+                "sql_source": "user",
+                "result": "仅当 config 中 data_source.mode 为 omr_db 时支持本工具。",
+                "report": (
+                    "=== execute_omr_sql 执行报告 ===\n\n【SQL】\n"
+                    f"{sql_stripped}\n\n【错误】\n当前数据源不是 omr_db。\n"
+                ),
+            }
+
+        if not self._omr_client:
+            self._omr_client = self._build_omr_client(self._config)
+        if not self._omr_client:
+            return {
+                "ok": False,
+                "session_id": session_id,
+                "generated_sql": sql_stripped,
+                "sql_source": "user",
+                "result": "未配置 OMR 数据库连接（username/password/dsn）。",
+                "report": (
+                    "=== execute_omr_sql 执行报告 ===\n\n【SQL】\n"
+                    f"{sql_stripped}\n\n【错误】\n未配置 OMR 连接。\n"
+                ),
+            }
+
+        safe, reason = OemNl2SqlEngine._is_safe_sql(sql_stripped)
+        if not safe:
+            return {
+                "ok": False,
+                "session_id": session_id,
+                "generated_sql": sql_stripped,
+                "sql_source": "user",
+                "result": f"安全检查未通过: {reason}",
+                "report": (
+                    "=== execute_omr_sql 执行报告 ===\n\n【SQL】\n"
+                    f"{sql_stripped}\n\n【错误】\n安全检查未通过: {reason}\n"
+                ),
+            }
+
+        try:
+            rows = self._omr_client.execute_sql(sql_stripped)
+        except Exception as e:
+            return {
+                "ok": False,
+                "session_id": session_id,
+                "generated_sql": sql_stripped,
+                "sql_source": "user",
+                "result": str(e),
+                "report": (
+                    "=== execute_omr_sql 执行报告 ===\n\n【SQL】\n"
+                    f"{sql_stripped}\n\n【错误】\n{e}\n"
+                ),
+            }
+
+        oem_errors: list[str] = []
+        if len(rows) > self._MAX_EXECUTE_OMR_SQL_ROWS:
+            rows = rows[: self._MAX_EXECUTE_OMR_SQL_ROWS]
+            oem_errors.append(f"结果已截断为前 {self._MAX_EXECUTE_OMR_SQL_ROWS} 行")
+
+        fetched = FetchDataResult(
+            session_id=session_id,
+            need_follow_up=False,
+            follow_up_question=None,
+            intent_type=None,
+            target_name=None,
+            target_type_name=None,
+            time_range=None,
+            metric_keys=[],
+            route_key=None,
+            scenario=None,
+            classifier="execute_omr_sql",
+            confidence=None,
+            latest_data=rows,
+            metric_time_series=[],
+            incidents=[],
+            events=[],
+            oem_errors=oem_errors,
+            generated_sql=sql_stripped,
+            sql_source="user",
+        )
+        report = self.build_fetch_tool_report(fetched, sql_stripped)
+        report = report.replace(
+            "=== fetch_data_from_oem 执行报告 ===",
+            "=== execute_omr_sql 执行报告 ===",
+            1,
+        )
+
+        return {
+            "ok": True,
+            "session_id": session_id,
+            "generated_sql": sql_stripped,
+            "sql_source": "user",
+            "intent": {
+                "intent_type": None,
+                "target_name": None,
+                "target_type_name": None,
+                "time_range": None,
+                "metric_keys": [],
+                "route_key": None,
+            },
+            "routing": {
+                "scenario": None,
+                "classifier": "execute_omr_sql",
+                "confidence": None,
+            },
+            "data": {
+                "latest_data": rows,
+                "metric_time_series": [],
+                "incidents": [],
+                "events": [],
+            },
+            "report": report,
+        }
 
     # ------------------------------------------------------------------
     # 数据层入口（供 fetch_data_from_oem MCP tool 和 run_skill_with_llm 复用）
@@ -540,8 +845,20 @@ class AskOpsService:
         return merged
 
     @staticmethod
+    def _union_keys_in_order(rows: list[dict[str, Any]]) -> list[str]:
+        """合并多行字典的全部键，顺序为：先按首行键序，再追加仅在后行出现的键。"""
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for r in rows:
+            for k in r.keys():
+                if k not in seen:
+                    seen.add(k)
+                    ordered.append(k)
+        return ordered
+
+    @staticmethod
     def _format_table(rows: list[dict[str, str]], headers: list[str]) -> str:
-        """生成纯文本表格。rows 为空时返回"未查询到数据。"。"""
+        """生成纯文本表格。rows 为空时返回"未查询到数据。"。单元格不截断，完整显示。"""
         if not rows:
             return "未查询到数据。"
         width: dict[str, int] = {h: len(h) for h in headers}
@@ -550,10 +867,10 @@ class AskOpsService:
                 width[h] = max(width[h], len(str(row.get(h, "-"))))
 
         def fmt_line(values: list[str]) -> str:
-            return " ".join(v.ljust(width[h]) for v, h in zip(values, headers))
+            return " | ".join(str(v).ljust(width[h]) for v, h in zip(values, headers))
 
         header_line = fmt_line(headers)
-        dash_line = fmt_line(["-" * len(h) for h in headers])
+        dash_line = "-+-".join("-" * width[h] for h in headers)
         row_lines = [fmt_line([str(r.get(h, "-")) for h in headers]) for r in rows]
         return "\n".join([header_line, dash_line, *row_lines])
 

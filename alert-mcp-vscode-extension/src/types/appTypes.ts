@@ -41,6 +41,46 @@ export interface ChatTurn {
   tool_calls?: OpenAiCompatibleToolCall[];
 }
 
+/** One persisted chat session (metadata + full message list, no truncation). */
+export interface ConversationMeta {
+  id: string;
+  title: string;
+  updatedAt: number;
+}
+
+export type StoredChatMessage =
+  | {
+      id: string;
+      kind: 'user';
+      createdAt: number;
+      text: string;
+      preferredTools?: string[];
+    }
+  | {
+      id: string;
+      kind: 'assistant';
+      createdAt: number;
+      result: AssistantResult;
+    }
+  | {
+      id: string;
+      kind: 'info';
+      createdAt: number;
+      text: string;
+    };
+
+export interface ConversationSnapshot {
+  meta: ConversationMeta;
+  messages: StoredChatMessage[];
+}
+
+/** Webview bootstrap: list metadata + full messages for the active session only. */
+export interface ConversationsBootstrapPayload {
+  items: ConversationMeta[];
+  activeId: string;
+  activeMessages: StoredChatMessage[];
+}
+
 export interface OpenAiCompatibleToolCall {
   id: string;
   type: 'function';

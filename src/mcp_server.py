@@ -61,11 +61,16 @@ def fetch_data_from_oem(
         return {
             "ok": False,
             "session_id": fetched.session_id,
+            "generated_sql": fetched.generated_sql,
+            "sql_source": fetched.sql_source,
             "result": fetched.follow_up_question,
+            "report": service.build_fetch_tool_report(fetched, question),
         }
     return {
         "ok": True,
         "session_id": fetched.session_id,
+        "generated_sql": fetched.generated_sql,
+        "sql_source": fetched.sql_source,
         "intent": {
             "intent_type": fetched.intent_type,
             "target_name": fetched.target_name,
@@ -85,7 +90,29 @@ def fetch_data_from_oem(
             "incidents": fetched.incidents,
             "events": fetched.events,
         },
+        "report": service.build_fetch_tool_report(fetched, question),
     }
+
+
+@mcp.tool()
+def execute_omr_sql(
+    sql: str | None = None,
+    query: str | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """
+    在 OMR 资料库上执行前端传入的单条只读 SQL，返回结果结构与 fetch_data_from_oem 成功时一致（含 data、report、generated_sql）。
+
+    前置条件：config 中 data_source.mode 为 omr_db，且已配置 OMR 连接（omr_db / 环境变量）。
+
+    安全策略：与 NL2SQL 相同——仅允许 SELECT；禁止分号与 DDL/DML；SQL 中须引用允许的 OMR 视图白名单。
+
+    参数：sql 与 query 二选一（优先 sql）；部分客户端与其它工具一致只传 query，须兼容。
+
+    说明：session_id 仅作回显，OMR 直连不依赖 OEM 会话。
+    """
+    sql_text = (sql or query or "").strip()
+    return service.execute_omr_sql(sql=sql_text, session_id=session_id)
 
 
 @mcp.tool()
@@ -131,7 +158,7 @@ def health_check() -> dict[str, Any]:
         "ok": True,
         "server": "ai-gateway-mvp",
         "version": SERVER_VERSION,
-        "tools": ["health_check", "oem_api_login", "fetch_data_from_oem", "run_skill"],
+        "tools": ["health_check", "oem_api_login", "fetch_data_from_oem", "execute_omr_sql", "run_skill"],
         "config": {
             "data_source_mode": config.data_source_mode,
             "default_base_url": config.default_base_url,

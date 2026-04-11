@@ -46,8 +46,10 @@ VIEW_SCHEMA_DESCRIPTION = """
 1. MGMT$TARGET — 监控目标清单
    列: TARGET_NAME, TARGET_TYPE, DISPLAY_NAME, HOST_NAME, LAST_LOAD_TIME_UTC, TYPE_DISPLAY_NAME
 
-2. MGMT$INCIDENTS — 告警/事件
-   列: INCIDENT_NUM, SUMMARY_MSG, SEVERITY, PRIORITY, OWNER, OPEN_STATUS(1=未关闭), LAST_UPDATED_DATE, TARGET_NAME, TARGET_TYPE
+2. MGMT$INCIDENTS — 告警/事件（注意：此视图无 TARGET_NAME、无 TARGET_TYPE，仅有 TARGET_GUID 关联目标）
+   列: INCIDENT_ID, INCIDENT_NUM, SUMMARY_MSG, SEVERITY, PRIORITY, OWNER, CREATION_DATE, LAST_UPDATED_DATE,
+       EVENT_COUNT, OPEN_STATUS(1=未关闭), CLOSED_DATE, TARGET_GUID
+   需要目标名或目标类型时：JOIN MGMT$TARGET T ON MGMT$INCIDENTS.TARGET_GUID = T.TARGET_GUID，再用 T.TARGET_NAME / T.TARGET_TYPE 过滤
 
 3. SYSMAN.MGMT$METRIC_CURRENT — 当前指标值（最近一次采集）
    列: TARGET_NAME, TARGET_TYPE, METRIC_NAME, METRIC_COLUMN, METRIC_LABEL, COLUMN_LABEL, VALUE, COLLECTION_TIMESTAMP, KEY_VALUE,VALUE
@@ -295,7 +297,10 @@ Q: "omrd 的 CPU 使用率是多少"
 A: {{"sql":"SELECT target_name, column_label, value, collection_timestamp FROM sysman.mgmt$metric_current WHERE LOWER(target_name) = LOWER('omrd') AND (column_label LIKE '%CPU%') ORDER BY collection_timestamp DESC FETCH FIRST 20 ROWS ONLY"}}
 
 Q: "当前有哪些未关闭的告警"
-A: {{"sql":"SELECT target_name, summary_msg, severity, priority, last_updated_date FROM mgmt$incidents WHERE open_status = 1 ORDER BY last_updated_date DESC FETCH FIRST 100 ROWS ONLY"}}
+A: {{"sql":"SELECT incident_num, summary_msg, severity, priority, last_updated_date FROM mgmt$incidents WHERE open_status = 1 ORDER BY last_updated_date DESC FETCH FIRST 100 ROWS ONLY"}}
+
+Q: "列出当前 19c 主机的告警有哪些"
+A: {{"sql":"SELECT i.incident_num, i.summary_msg, i.severity, i.priority, i.last_updated_date, t.target_name, t.target_type FROM mgmt$incidents i INNER JOIN mgmt$target t ON i.target_guid = t.target_guid WHERE i.open_status = 1 AND (LOWER(t.target_type) = 'host' OR LOWER(t.target_type) = 'oracle_database') ORDER BY i.last_updated_date DESC FETCH FIRST 100 ROWS ONLY"}}
 
 Q: "omrd 数据库的内存使用情况"
 A: {{"sql":"SELECT target_name, column_label, value, collection_timestamp FROM sysman.mgmt$metric_current WHERE LOWER(target_name) = LOWER('omrd') AND (column_label LIKE '%Memory%' OR column_label LIKE '%SGA%' OR column_label LIKE '%PGA%') ORDER BY collection_timestamp DESC FETCH FIRST 30 ROWS ONLY"}}
@@ -345,7 +350,8 @@ class OemNl2SqlEngine:
                             "4. 查询指标数据时优先用 SYSMAN.MGMT$METRIC_CURRENT，通过 COLUMN_LABEL LIKE 过滤\n"
                             "5. 尽量加 WHERE 过滤和 FETCH FIRST N ROWS ONLY 限制行数\n"
                             "6. 如果问题中提到了目标名称，用 WHERE LOWER(TARGET_NAME) = LOWER('目标名') 过滤\n"
-                            "7. 参考上方的示例 Q&A 来理解中文概念到 COLUMN_LABEL 的映射关系"
+                            "7. 参考上方的示例 Q&A 来理解中文概念到 COLUMN_LABEL 的映射关系\n"
+                            "8. 禁止在 MGMT$INCIDENTS 上直接使用 TARGET_NAME 或 TARGET_TYPE；必须先 JOIN MGMT$TARGET"
                         ),
                     ),
                     ("human", "问题: {question}"),
