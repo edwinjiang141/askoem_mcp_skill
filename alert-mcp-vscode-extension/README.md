@@ -1,251 +1,80 @@
 # OEM Assistant for VS Code
 
-一个面向“告警查询与处理”场景的专用 VS Code 插件骨架。
-
-> 本文档已同步当前版本的**功能实现现状**与**已修复问题**，可直接作为客户演示/MVP 方案说明。
+面向 **OEM 运维 / 取数 / 告警排查** 的专用扩展：连接 MCP 后端、OpenAI 兼容 LLM、可选 **Oracle 文档 RAG**；主控制台支持 `@tool` 编排、`fetch_data_from_oem` 结果 **Chart.js 图表或表格**、多会话持久化与 Tool Execution Trace。
 
 ---
 
-## 0. 当前版本实现总结（MVP 可落地）
+## 1. 功能概览
 
-### 0.1 已完成的核心能力
-
-1. **独立 Settings 界面（Webview）**
-   - 提供独立设置页，集中维护 MCP / LLM / OEM 配置。
-   - 支持：
-     - MCP SSE 地址与连接模式
-     - LLM Provider / Base URL / Model / Temperature
-     - OEM Base URL / Username
-     - LLM API Key / MCP Token / OEM Password（密码类走 SecretStorage）
-
-2. **MCP 连接与工具发现**
-   - 支持 `auto / legacy-sse / streamable-http` 三种连接模式。
-   - `auto` 模式会优先 Streamable HTTP，失败后回退 SSE。
-   - Sidebar 展示连接状态、模型信息、可用工具列表与数量。
-
-3. **控制台对话能力（Cline 风格 MVP）**
-   - 保留输入框 + 提交按钮的对话体验。
-   - 支持执行轨迹（Tool Execution Trace）展示。
-   - 支持平滑打字机输出效果。
-   - 对敏感信息进行前后端脱敏，避免凭据泄露。
-
-4. **`@tool` 选择与调用编排**
-   - 输入 `@` 会弹出工具列表，支持模糊检索、键盘上下选择、回车插入。
-   - 支持多 `@tool` 顺序执行（按输入顺序）。
-   - 支持单 `@tool` 直接执行（不再依赖 LLM 是否愿意发起 tool_call）。
-
-5. **OEM 登录自动化**
-   - 输入“登录OEM”或 `@oem_login` 时，优先走直接登录流程。
-   - 自动从 settings + SecretStorage 注入 OEM 凭据，不再反问账号密码。
-   - 提取并复用 `session_id`，用于后续工具调用认证。
-
-6. **会话上下文（128KB）**
-   - 单会话历史上下文缓存（上限 128KB）。
-   - 超限会自动裁剪最早历史，MCP 断开时清空会话上下文。
-
-7. **打包与构建稳定性**
-   - 修复 `@cfworker/json-schema` 依赖解析问题（esbuild alias + shim）。
-   - `npm run package` 先 build 再 vsce package，支持快速产物演示。
+| 能力 | 说明 |
+|------|------|
+| **OEM 控制台** | 命令 `OEM Assistant: Open Console`；侧栏 **Operations** 打开；`@` 选择 MCP 工具、多工具按输入顺序执行；打字机输出与脱敏。 |
+| **RAG 控制台** | 命令 `OEM Assistant: Open Console RAG`；**不经过 MCP**；检索范围 **docs.oracle.com/en/** 与 **blogs.oracle.com**（Tavily）；回答底部 **相关文档** 链接。 |
+| **MCP** | `auto` / `legacy-sse` / `streamable-http`；侧栏展示连接状态、工具列表。 |
+| **LLM** | `openai-compatible`（默认 DeepSeek 类）或 `copilot`；Base URL / Model / Temperature 可配。 |
+| **会话** | 多会话列表、新建/切换/重命名/删除；`globalState` 持久化完整 `AssistantResult`（含 `steps`）。 |
+| **设置** | Webview Settings：MCP、LLM、OEM、UI、RAG；密钥走 **SecretStorage**（不写明文进 `settings.json`）。 |
+| **取数可视化** | `fetch_data_from_oem` 成功且开启 `alertMcp.ui.showFetchDataCharts` 时，在助手正文下方渲染 **数据图表** 区块（最多 10 块）；详见下文 **§3**。 |
+| **Trace** | 工具步骤 `detail` 优先展示完整 **`report`**（含 SQL 追踪）；气泡正文仍优先 **`llm_summary`**（若存在）。 |
 
 ---
 
-### 0.2 已修复的关键问题（按能力归类）
+## 2. 命令与入口
 
-1. **Ask 按钮偶发无响应**
-   - 修复 Webview 消息监听在面板重开后失效的问题。
-
-2. **工具点击/展示交互不一致**
-   - 工具项从“执行入口”收敛为“说明 + `@tool` 显式调用”模式，避免误触发。
-
-3. **OEM 登录仍要求手填凭据**
-   - 修复为优先读取插件设置与 SecretStorage，登录自动注入。
-
-4. **敏感信息泄露风险**
-   - 对工具参数、工具返回与最终回答进行脱敏（用户名/密码/API 地址等）。
-
-5. **多 `@tool` 顺序与依赖问题**
-   - 修复工具顺序错乱：严格按用户输入顺序执行。
-   - 修复 `oem_login` 后 `ask_ops` 认证失败：自动透传/复用 `session_id`。
-
-6. **结果重复输出（text + structuredContent 重复）**
-   - MCP 返回处理增加去重策略，避免最终结果重复渲染。
-
-7. **ask_ops 误拦截提示（非预期）**
-   - 收窄告警诊断强制规则，避免普通主机查询被误判。
-   - 显式 `@ask_ops` 现在直接执行，避免出现“请显式使用 @ask_ops”的错误提示。
+- **OEM Assistant: Open Console** — 主 OEM 聊天 Webview。
+- **OEM Assistant: Open Console RAG** — RAG 专用 Webview（`alertMcpRagConsole`）。
+- **OEM Assistant: Connect MCP Server** / **Disconnect MCP Server**
+- **OEM Assistant: Set LLM API Key** / **Set MCP Bearer Token**
+- **OEM Assistant: Open Settings** — 插件设置页（Webview）。
+- 侧栏 **Operations** 视图：连接、打开控制台、打开 RAG、打开设置、刷新。
 
 ---
 
-### 0.3 当前设计边界（与你的要求保持一致）
+## 3. `fetch_data_from_oem` 图表与表格（当前策略）
 
-1. **插件端只实现通用编排与体验**
-   - 连接 MCP、工具编排、结果展示、设置与密钥管理。
+图表由扩展侧 **`buildFetchDataChartsPayload`** 解析 MCP 返回 JSON（`data.metric_time_series`、`data.latest_data` 等）生成 **`FetchDataChartSpec`**，Webview 用 **Chart.js**（`media/chart.umd.min.js`）或 HTML **表格** 渲染。
 
-2. **工具依赖关系判定交由 MCP Server**
-   - 插件仅保证：
-     - 登录前置能力可用（`oem_login` + `session_id` 复用）
-     - 多工具按顺序触发
-   - 更复杂的“工具间依赖图/前置条件”由 MCP Server 后续扩展实现。
+**开关**：`alertMcp.ui.showFetchDataCharts`（默认 `true`）；主界面可勾选 **显示数据图表**（`localStorage`：`oemAssistant.showCharts`）。
 
-3. **MVP 优先“可演示可落地”**
-   - 先完成闭环：可配置、可连接、可提问、可调用工具、可展示轨迹、可打包。
-   - 后续再逐步增强高风险动作确认、卡片化展示、审批流与 RBAC。
+**类型标签**：每个块标题上方展示 **「图表类型：折线图 / 柱状图 / 散点图（气泡）/ 表格」**。
 
-目标：
-- 单独配置你的 MCP Server
-- 单独配置你的 LLM（优先支持 OpenAI-compatible，适合 DeepSeek）
-- 用最小、清晰、可维护的结构做成可持续扩展的专用插件
+**表格**
 
-## 1. 方案定位
+- **`latest_data` 两列均为数值**：只生成 **表格**（两列数值），不画散点/气泡。
+- **遗留 `scatter` + `scatterPoints`**：在应用用户图表偏好前归一为 **表格**（用户显式要折线/柱状时除外）。
+- **用户问题含「散点图 / scatter」**：原先把折线/柱状转成散点；现改为 **两列表格**（类别/序号 + 数值）。
+- **多系列**：`tableColumns` / `tableRows` 支持 **多列**（首列横轴，其余列为各序列）。
 
-这不是一个通用 IDE Agent，而是一个专门服务于你的告警场景的“轻量客户端”。
+**折线图**
 
-推荐边界：
-- **插件负责**：连接 MCP、读取工具清单、把工具暴露给 LLM、渲染结果、保存配置与密钥
-- **MCP Server 负责**：真正的告警查询、过滤、汇总、处置、确认、关闭等能力
-- **LLM 负责**：意图理解、参数组织、调用哪个工具、如何总结结果
+- **横轴点数 1～3**：在 `finalizeCharts` 中把该折线图 **整表化**（与多系列规则一致）；**4 点及以上**保持折线。
+- **柱状图**不按条数强制改表格。
 
-这样拆分以后，后面无论你换：
-- MCP Server 实现
-- LLM 厂商
-- UI 交互方式
-- 审批/确认流程
-
-都不需要整体推翻。
+**用户问题中的图表偏好**（`parseChartPreferencesFromQuestion`）：识别「折线图/柱状图/散点图」「分图/合并」「N 个图」等，传入 `applyChartTypePreference` 做轻量调整；与上表规则叠加时以 **payload 归一逻辑**为准。
 
 ---
 
-## 2. MVP 功能范围
+## 4. 配置项（`contributes.configuration`）
 
-### 必做
-1. 在 VS Code 设置中配置：
-   - MCP Server URL
-   - MCP 连接模式（auto / legacy-sse / streamable-http）
-   - LLM Base URL
-   - LLM Model
-   - Temperature
+| 键 | 含义 |
+|----|------|
+| `alertMcp.mcp.serverUrl` | MCP 服务 URL（旧版常用 `/sse` 端点）。 |
+| `alertMcp.mcp.connectionMode` | `auto` \| `legacy-sse` \| `streamable-http`。 |
+| `alertMcp.mcp.requestTimeoutMs` | 单次 MCP 调用超时（毫秒）。 |
+| `alertMcp.llm.provider` | `openai-compatible` \| `copilot`。 |
+| `alertMcp.llm.baseUrl` / `model` / `temperature` | OpenAI 兼容 Chat API。 |
+| `alertMcp.ui.maxToolRounds` | 单次用户请求内模型—工具最大轮数。 |
+| `alertMcp.ui.showFetchDataCharts` | 是否渲染取数图表区块。 |
+| `alertMcp.oem.baseUrl` / `username` | OEM 企业账号（密码在 SecretStorage）。 |
+| `alertMcp.rag.searchTopK` | Tavily 单次最大结果数。 |
+| `alertMcp.rag.snippetMaxChars` | 抓取网页拼进 LLM 的总字符预算。 |
+| `alertMcp.rag.fetchSnippetPages` | 对前 N 条结果拉取 HTML 片段（0 表示仅链接）。 |
 
-2. 在 VS Code SecretStorage 中保存：
-   - LLM API Key
-   - MCP Bearer Token（可选）
-
-3. 左侧 Sidebar 显示：
-   - MCP 连接状态
-   - 当前模型
-   - 当前工具数量
-   - 可用工具列表（前若干项）
-
-4. 打开一个 Webview Console：
-   - 输入问题
-   - 调用 LLM
-   - 自动决定是否调用 MCP tool
-   - 返回最终答案
-   - 展示执行轨迹
-
-### 第二阶段再做
-- 用户确认后才能执行高风险操作
-- 对不同 tool 做参数表单化输入
-- 多轮会话持久化
-- 审批流 / RBAC
-- deepseek-reasoner 专项适配
-- 告警对象卡片化、表格化、趋势图
+**密钥（SecretStorage，不在 `settings.json` 明文）**：LLM API Key、MCP Bearer Token、OEM Password、**Tavily API Key**（RAG 在 Settings 面板「RAG」中配置）。
 
 ---
 
-## 3. 推荐目录结构
-
-```text
-src/
-  extension.ts                    # 入口
-  commands/
-    commandHelpers.ts             # 配置密钥等命令
-  services/
-    settingsService.ts            # 读取 settings.json
-    secretStorageService.ts       # 安全保存 API key / token
-    mcp/
-      mcpClientService.ts         # MCP 连接、listTools、callTool
-    llm/
-      openAiCompatibleLlmService.ts
-  orchestration/
-    assistantOrchestrator.ts      # LLM + Tool Loop 核心编排
-  views/
-    opsSidebarProvider.ts         # 左侧树
-    chatPanel.ts                  # 主 Webview
-  types/
-    appTypes.ts
-```
-
----
-
-## 4. 交互流程
-
-```text
-用户输入问题
-   ↓
-AssistantOrchestrator 读取 MCP tools
-   ↓
-将 MCP tools 转成 OpenAI-compatible tools schema
-   ↓
-调用 LLM
-   ↓
-如果 LLM 返回 tool_calls
-   ↓
-调用 MCP tool
-   ↓
-把 tool result 再喂回 LLM
-   ↓
-得到最终回答
-   ↓
-Webview 展示“最终答案 + 执行轨迹”
-```
-
----
-
-## 5. 为什么这个方案适合你
-
-### 简单
-- 不依赖复杂的 IDE Agent 框架
-- 不绑定 Cline 内部机制
-- 只做你真正需要的功能
-
-### 容易落地
-- UI 用 VS Code 原生 Sidebar + Webview
-- 配置走 `contributes.configuration`
-- 密钥走 `SecretStorage`
-- MCP 层独立，LLM 层独立
-
-### 方便维护和扩展
-- 后面要换 DeepSeek、OpenAI、内部代理，只改 `llm/`
-- 后面要把 SSE 升级为 Streamable HTTP，只改 `mcp/`
-- 后面要加审批、审计、会话历史，只加新服务层
-
----
-
-## 6. 开发步骤
-
-### 6.1 安装依赖
-
-```bash
-npm install
-```
-
-### 6.2 本地调试
-
-```bash
-npm run build
-```
-
-然后在 VS Code 中按 `F5` 启动 Extension Development Host。
-
-### 6.3 初始化配置
-
-在扩展宿主里执行命令：
-- `OEM Assistant: Set LLM API Key`
-- `OEM Assistant: Set MCP Bearer Token`（如果需要）
-- `OEM Assistant: Connect MCP Server`
-- `OEM Assistant: Open Console`
-
-### 6.4 建议的初始 settings.json
+## 5. 推荐本地 `settings.json` 片段
 
 ```json
 {
@@ -254,57 +83,79 @@ npm run build
   "alertMcp.llm.provider": "openai-compatible",
   "alertMcp.llm.baseUrl": "https://api.deepseek.com",
   "alertMcp.llm.model": "deepseek-chat",
-  "alertMcp.llm.temperature": 0.1
+  "alertMcp.llm.temperature": 0.1,
+  "alertMcp.ui.showFetchDataCharts": true
 }
 ```
 
 ---
 
-## 7. 与你当前场景最相关的建议
+## 6. 开发与打包
 
-1. **MVP 先默认 `deepseek-chat`**
-   - 因为面向 tool-calling 的接入最直接，工程复杂度最低。
+```bash
+npm install
+npm run lint
+npm run build
+```
 
-2. **现有 SSE MCP Server 先兼容，不急着重写服务端**
-   - 客户端已经预留 `auto` 模式：优先尝试 Streamable HTTP，再 fallback 到 legacy SSE。
-
-3. **高风险 tool 不要直接开放给模型裸调**
-   - 建议在后续版本加：
-     - destructive 标识
-     - 二次确认
-     - 操作审计日志
-     - 只读 / 可执行分层
-
-4. **不要把所有业务逻辑塞进 prompt**
-   - 过滤规则、字段映射、默认时间范围、告警级别映射，尽量沉到 MCP Server 或插件配置层。
+- **`npm run build`**：esbuild 打包 + 将 **Chart.js UMD** 复制到 `media/chart.umd.min.js`（`scripts/copy-chart.mjs`）。
+- 在 VS Code 中 **F5** 启动 Extension Development Host 调试。
+- 发布包：`npm run package`（先 build 再 `vsce package`）。
 
 ---
 
-## 8. 下一步最值得做的增强
+## 7. 源码目录（与仓库一致）
 
-### A. 增加“操作确认门”
-例如：
-- 查询类：直接执行
-- 处置类：必须弹出确认框
-- 关闭类：必须输入 reason
-
-### B. 增加“场景模板”
-例如在侧栏提供：
-- 最近 2 小时 P1 告警
-- 按对象分组统计
-- 查询某个主机当前告警
-- 查询并给出处置建议
-
-### C. 增加“输出结构化卡片”
-对典型 tool 的 `structuredContent` 做专门渲染，而不是纯文本。
-
-### D. 增加“组织级配置”
-把公共配置抽到 workspace settings，让团队共用 server URL、默认模型、默认策略。
+```text
+src/
+  extension.ts                 # 激活、命令、ChatPanel / RagChatPanel / Settings
+  commands/commandHelpers.ts
+  services/
+    settingsService.ts
+    secretStorageService.ts
+    conversationStore.ts
+    oracleDocSearchService.ts  # Tavily + Oracle 域过滤
+    mcp/mcpClientService.ts
+    llm/openAiCompatibleLlmService.ts
+  orchestration/
+    assistantOrchestrator.ts    # OEM 主循环、工具结果格式化、fetchCharts 附加
+    ragOrchestrator.ts         # RAG 问答
+  charts/
+    buildFetchDataChartsPayload.ts
+    parseChartPreferencesFromQuestion.ts
+  views/
+    chatPanel.ts / chatPanelHtml.ts / chatPanelTypes.ts
+    ragChatPanel.ts
+    settingsPanel.ts
+    opsSidebarProvider.ts
+  types/appTypes.ts
+```
 
 ---
 
-## 9. 已知注意点
+## 8. 编排数据流（OEM 控制台）
 
-1. 这个骨架优先解决“架构正确、边界清晰、容易起步”的问题。
-2. `@modelcontextprotocol/client`、VS Code API、以及 MCP 新版 transport 还在持续演进，首次落地时请按当前官方文档微调依赖版本。
-3. `deepseek-reasoner` 的 Thinking + Tool Calls 能力更强，但接入时需要处理额外的 reasoning continuation 逻辑，建议放到第二阶段。
+```text
+用户输入 → AssistantOrchestrator（tools + LLM）
+       → 若 tool_calls → MCP callTool → 结果写回 steps
+       → fetch_data_from_oem 成功时附加 fetchCharts（可选）
+       → 最终文本 + Webview 展示 Trace + 数据图表区块
+```
+
+RAG 控制台不注册 MCP 工具列表；仅 Tavily 检索 + LLM + `referenceLinks`。
+
+---
+
+## 9. 边界与注意
+
+- **业务规则、SQL、NL2SQL** 在 **MCP / Python 服务**（仓库 `src/`）；扩展负责连接、展示、图表 payload、密钥与会话。
+- 修改扩展后 **重新加载窗口**；修改 MCP 后 **重启 MCP 进程**。
+- `@modelcontextprotocol/client` 与 MCP transport 随上游演进，升级依赖时对照官方文档。
+
+---
+
+## 10. 后续可增强方向（未承诺排期）
+
+- 高风险 tool 二次确认、审计日志、只读/写权限分层。
+- 特定 `structuredContent` 的卡片化展示。
+- Workspace 级团队默认配置共享。
