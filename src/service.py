@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import re
 import os
 from typing import Any, Optional
@@ -53,6 +54,22 @@ def _split_mixed_omr_question(question: str) -> list[str] | None:
     if not any(flags) or all(flags):
         return None
     return parts
+
+
+def _try_parse_float_cell(raw: Any) -> float | None:
+    """将单元格值尝试解析为 float；失败返回 None（不抛错）。"""
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if s == "" or s == "-":
+        return None
+    t = s.replace(",", "")
+    if t.endswith("%"):
+        t = t[:-1].strip()
+    try:
+        return float(t)
+    except ValueError:
+        return None
 
 
 @dataclass
@@ -373,9 +390,202 @@ class AskOpsService:
                 data_text = self._format_incidents_events_snippet(fetched)
             lines.append(data_text)
         lines.append("")
+        lines.append("【数据摘要】")
+        lines.append(self.build_fetch_data_fact_summary(fetched))
+        lines.append("")
         lines.append("【元信息】")
         lines.append(f"session_id: {fetched.session_id or '-'}")
         return "\n".join(lines)
+
+    def build_fetch_data_fact_summary(self, fetched: FetchDataResult) -> str:
+        """
+        仅基于 FetchDataResult 内已有数据的客观摘要（无 LLM）。
+        不推断根因、严重度或处置建议；仅行数、列名、可解析数值的 min/max、低基数去重取值等。
+        """
+        if fetched.need_follow_up:
+            q = (fetched.follow_up_question or "").strip()
+            if q:
+                return f"未完成取数：需要追问。\n追问内容：{q}"
+            return "未完成取数：需要追问。"
+
+        if fetched.omr_sub_queries:
+            blocks: list[str] = []
+            for i, sub in enumerate(fetched.omr_sub_queries, 1):
+                sq = str(sub.get("sub_question", "")).strip()
+                rows = sub.get("latest_data") or []
+                head = f"--- 子查询 {i}" + (f"({sq})" if sq else "") + " ---"
+                body = "\n".join(self._fact_summary_lines_for_rows(rows))
+                blocks.append(f"{head}\n{body}")
+            aux = self._fact_summary_auxiliary_lists(fetched)
+            if aux:
+                blocks.append(aux)
+            return "\n\n".join(blocks)
+
+        rows = fetched.latest_data or []
+        if not rows and (fetched.incidents or fetched.events):
+            return "\n".join(self._fact_summary_incidents_events_only(fetched))
+
+        out_lines = self._fact_summary_lines_for_rows(rows)
+        aux = self._fact_summary_auxiliary_lists(fetched)
+        if aux:
+            out_lines.append(aux)
+        return "\n".join(out_lines)
+
+    def _compact_fetch_payload_for_llm(self, fetched: FetchDataResult) -> str:
+        """供 LLM 总结用的数据片段（JSON 字符串，有长度上限）。"""
+        if fetched.omr_sub_queries:
+            blocks: list[dict[str, Any]] = []
+            for s in fetched.omr_sub_queries:
+                rows = s.get("latest_data") or []
+                blocks.append(
+                    {
+                        "sub_question": s.get("sub_question", ""),
+                        "row_count": len(rows),
+                        "sample_rows": rows[:40],
+                    }
+                )
+            obj: dict[str, Any] = {"mode": "multi_query", "sub_queries": blocks}
+        else:
+            obj = {
+                "latest_data": (fetched.latest_data or [])[:50],
+                "metric_time_series": (fetched.metric_time_series or [])[:20],
+                "incidents": (fetched.incidents or [])[:20],
+                "events_count": len(fetched.events or []),
+            }
+        raw = json.dumps(obj, ensure_ascii=False, default=str)
+        max_len = 14000
+        if len(raw) > max_len:
+            return raw[:max_len] + "\n…(截断)"
+        return raw
+
+    def build_fetch_llm_summary(self, question: str, fetched: FetchDataResult) -> str:
+        """
+        仅基于客观摘要与数据片段调用 LLM 写自然语言总结；不编造数据中不存在的实体。
+        若未配置 DEEPSEEK_API_KEY 或调用失败，返回空字符串（由调用方回退到 result_summary）。
+        """
+        if fetched.need_follow_up:
+            return ""
+        api_key = (os.getenv("DEEPSEEK_API_KEY") or "").strip()
+        if not api_key:
+            return ""
+        try:
+            from langchain_core.output_parsers import StrOutputParser
+            from langchain_core.prompts import ChatPromptTemplate
+            from langchain_openai import ChatOpenAI
+        except Exception:
+            return ""
+
+        base_url = (os.getenv("DEEPSEEK_BASE_URL") or "https://api.deepseek.com").strip()
+        model = (os.getenv("DEEPSEEK_MODEL") or "deepseek-chat").strip()
+        fact = self.build_fetch_data_fact_summary(fetched)
+        payload = self._compact_fetch_payload_for_llm(fetched)
+        prompt = ChatPromptTemplate.from_messages([
+            (
+                "system",
+                (
+                    "你是 OEM 运维数据解读助手。必须只根据用户提供的「客观摘要」与「数据片段」写总结。\n"
+                    "规则：只陈述数据中出现的名称、数值、行数、列名；禁止编造任何未在数据中出现的对象、指标或结论；"
+                    "禁止推断根因、严重度、是否需要扩容或变更；禁止补充用户未提供的阈值。\n"
+                    "输出：简洁中文，3～8 句；无数据时说明未查到行或仅有事件/时序条数。"
+                ),
+            ),
+            (
+                "human",
+                "用户问题：{question}\n\n【客观摘要】\n{fact}\n\n【数据片段 JSON】\n{payload}",
+            ),
+        ])
+        try:
+            chain = (
+                prompt
+                | ChatOpenAI(api_key=api_key, base_url=base_url, model=model, temperature=0.0)
+                | StrOutputParser()
+            )
+            return str(chain.invoke({
+                "question": question.strip(),
+                "fact": fact,
+                "payload": payload,
+            })).strip()
+        except Exception:
+            return ""
+
+    def _fact_summary_lines_for_rows(self, rows: list[dict[str, Any]]) -> list[str]:
+        """单行集：行数、列名、逐列非空与数值或去重统计。"""
+        if not rows:
+            return ["未查询到数据行。"]
+        n = len(rows)
+        headers = AskOpsService._union_keys_in_order(rows)
+        max_cols_list = 30
+        if len(headers) > max_cols_list:
+            col_line = (
+                f"列（前 {max_cols_list} 个，共 {len(headers)} 列）: "
+                + ", ".join(headers[:max_cols_list])
+            )
+        else:
+            col_line = f"列（共 {len(headers)} 列）: " + ", ".join(headers)
+        out: list[str] = [f"行数: {n}", col_line]
+        detail_cols = min(len(headers), 25)
+        for h in headers[:detail_cols]:
+            non_null: list[str] = []
+            for r in rows:
+                v = r.get(h)
+                if v is None:
+                    continue
+                s = str(v).strip()
+                if s == "" or s == "-":
+                    continue
+                non_null.append(s)
+            if not non_null:
+                out.append(f"  {h}: 无非空值")
+                continue
+            parsed = [_try_parse_float_cell(s) for s in non_null]
+            if all(p is not None for p in parsed):
+                nums = [float(p) for p in parsed if p is not None]
+                out.append(
+                    f"  {h}: 非空 {len(non_null)}；数值 min={min(nums)}, max={max(nums)}"
+                )
+            else:
+                uniq = sorted(set(non_null))
+                if len(uniq) <= 10:
+                    shown = uniq[:8]
+                    suffix = " ..." if len(uniq) > 8 else ""
+                    out.append(
+                        f"  {h}: 非空 {len(non_null)}；去重取值（{len(uniq)} 个）: "
+                        + ", ".join(shown)
+                        + suffix
+                    )
+                else:
+                    out.append(
+                        f"  {h}: 非空 {len(non_null)}；去重数 {len(uniq)}（>10，未展开）"
+                    )
+        if len(headers) > detail_cols:
+            out.append(f"（其余 {len(headers) - detail_cols} 列未逐列统计）")
+        return out
+
+    def _fact_summary_auxiliary_lists(self, fetched: FetchDataResult) -> str:
+        """顶层 metric_time_series / events 条数（不展开）。"""
+        parts: list[str] = []
+        if fetched.metric_time_series:
+            parts.append(f"metric_time_series: {len(fetched.metric_time_series)} 条（未逐点展开）")
+        if fetched.events:
+            parts.append(f"events: {len(fetched.events)} 条（未逐条展开）")
+        return "\n".join(parts) if parts else ""
+
+    def _fact_summary_incidents_events_only(self, fetched: FetchDataResult) -> list[str]:
+        """latest_data 为空但存在 incidents/events 时的客观条数。"""
+        lines: list[str] = ["latest_data: 0 行"]
+        if fetched.incidents:
+            lines.append(f"incidents: {len(fetched.incidents)} 条")
+            if len(fetched.incidents) <= 5:
+                nums = [
+                    str(
+                        r.get("incidentNum", r.get("incident_num", "-"))
+                    )
+                    for r in fetched.incidents
+                ]
+                lines.append("incident 编号: " + ", ".join(nums))
+        if fetched.events:
+            lines.append(f"events: {len(fetched.events)} 条（未逐条展开）")
+        return lines
 
     def _format_incidents_events_snippet(self, fetched: FetchDataResult) -> str:
         """latest_data 为空但存在 incidents/events 时的简短文本表。"""
@@ -577,6 +787,8 @@ class AskOpsService:
             "=== execute_omr_sql 执行报告 ===",
             1,
         )
+        rs = self.build_fetch_data_fact_summary(fetched)
+        llm_s = self.build_fetch_llm_summary(sql_stripped, fetched)
 
         return {
             "ok": True,
@@ -603,6 +815,9 @@ class AskOpsService:
                 "events": [],
             },
             "report": report,
+            "result_summary": rs,
+            "llm_summary": llm_s,
+            "result": llm_s if llm_s else rs,
         }
 
     # ------------------------------------------------------------------

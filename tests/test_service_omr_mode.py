@@ -59,7 +59,7 @@ class TestServiceOmrMode(unittest.TestCase):
         result = service.run_skill_with_llm("列出当前监控主机的信息")
         self.assertTrue(result["ok"])
         self.assertEqual(result["skill_name"], "builtin_query_reply")
-        self.assertIn("已查询到", result["result"])
+        self.assertIn("host01", result["result"])
 
     def test_build_omr_client_supports_env_fallback(self):
         raw = {

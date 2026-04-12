@@ -1,11 +1,13 @@
 import * as vscode from 'vscode';
 import { promptAndStoreLlmApiKey, promptAndStoreMcpToken } from './commands/commandHelpers';
 import { AssistantOrchestrator } from './orchestration/assistantOrchestrator';
-import { ConversationStore, messagesToChatTurns } from './services/conversationStore';
+import { ConversationStore, messagesToChatTurns, RAG_CONVERSATIONS_STORAGE_KEY } from './services/conversationStore';
 import { SecretStorageService } from './services/secretStorageService';
 import { SettingsService } from './services/settingsService';
 import { McpClientService } from './services/mcp/mcpClientService';
+import { RagOrchestrator } from './orchestration/ragOrchestrator';
 import { ChatPanel } from './views/chatPanel';
+import { RagChatPanel } from './views/ragChatPanel';
 import { OpsSidebarProvider } from './views/opsSidebarProvider';
 import { SettingsPanel } from './views/settingsPanel';
 import type { ChatTurn } from './types/appTypes';
@@ -38,23 +40,36 @@ export function activate(context: vscode.ExtensionContext): void {
   const conversationStore = new ConversationStore(context);
   conversationStore.ensureAtLeastOneConversation();
 
+  const ragConversationStore = new ConversationStore(context, RAG_CONVERSATIONS_STORAGE_KEY);
+  ragConversationStore.ensureAtLeastOneConversation();
+
   const sessionContextMap = new Map<string, ChatTurn[]>();
   const oemSessionIdByConvId = new Map<string, string>();
+  const ragSessionContextMap = new Map<string, ChatTurn[]>();
 
   const syncSessionContextFromStore = (convId: string): void => {
     const msgs = conversationStore.getMessagesForConversation(convId);
     sessionContextMap.set(convId, messagesToChatTurns(msgs));
   };
 
+  const syncRagSessionContextFromStore = (convId: string): void => {
+    const msgs = ragConversationStore.getMessagesForConversation(convId);
+    ragSessionContextMap.set(convId, messagesToChatTurns(msgs));
+  };
+
   syncSessionContextFromStore(conversationStore.getActiveId());
+  syncRagSessionContextFromStore(ragConversationStore.getActiveId());
 
   context.subscriptions.push(output, treeView);
 
   let panel: ChatPanel | undefined;
   let panelMessageDisposable: vscode.Disposable | undefined;
+  let ragPanel: RagChatPanel | undefined;
+  let ragPanelMessageDisposable: vscode.Disposable | undefined;
   context.subscriptions.push(
     new vscode.Disposable(() => {
       panelMessageDisposable?.dispose();
+      ragPanelMessageDisposable?.dispose();
     })
   );
 
@@ -74,14 +89,41 @@ export function activate(context: vscode.ExtensionContext): void {
     return ctx;
   };
 
+  const pushRagSessionTurn = (convId: string, turn: ChatTurn): void => {
+    const arr = ragSessionContextMap.get(convId) ?? [];
+    arr.push(turn);
+    trimSessionContext(arr);
+    ragSessionContextMap.set(convId, arr);
+  };
+
+  const getRagContextForAsk = (convId: string): ChatTurn[] => {
+    let ctx = ragSessionContextMap.get(convId);
+    if (!ctx) {
+      ctx = messagesToChatTurns(ragConversationStore.getMessagesForConversation(convId));
+      ragSessionContextMap.set(convId, ctx);
+    }
+    return ctx;
+  };
+
   const refreshPanelTitle = (p: ChatPanel): void => {
     const id = conversationStore.getActiveId();
     const c = conversationStore.getConversation(id);
     p.setPanelTitle(c?.meta.title ?? '');
   };
 
+  const refreshRagPanelTitle = (p: RagChatPanel): void => {
+    const id = ragConversationStore.getActiveId();
+    const c = ragConversationStore.getConversation(id);
+    p.setPanelTitle(c?.meta.title ?? '');
+  };
+
   const pushConversationListUpdate = (p: ChatPanel): void => {
     const boot = conversationStore.getBootstrapPayload();
+    p.postConversationListUpdate(boot.items, boot.activeId);
+  };
+
+  const pushRagConversationListUpdate = (p: RagChatPanel): void => {
+    const boot = ragConversationStore.getBootstrapPayload();
     p.postConversationListUpdate(boot.items, boot.activeId);
   };
 
@@ -165,6 +207,39 @@ export function activate(context: vscode.ExtensionContext): void {
       conversationStore.appendUserMessage(askConvId, userQuestion, preferredTools);
       conversationStore.appendInfoMessage(askConvId, message);
       pushSessionTurn(askConvId, { role: 'user', content: userQuestion });
+      currentPanel.postInfo(message);
+      vscode.window.showErrorMessage(message);
+    }
+  };
+
+  const runRagAsk = async (userQuestion: string): Promise<void> => {
+    const currentPanel = openRagPanel();
+    const askConvId = ragConversationStore.getActiveId();
+    const ctx = getRagContextForAsk(askConvId);
+    const settings = settingsService.get();
+    const orchestrator = new RagOrchestrator(settings, secrets, output);
+
+    try {
+      const result = await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: 'Running Oracle docs RAG...'
+        },
+        async () => orchestrator.ask(userQuestion, ctx)
+      );
+
+      ragConversationStore.appendUserMessage(askConvId, userQuestion, []);
+      ragConversationStore.appendAssistantMessage(askConvId, result);
+      pushRagSessionTurn(askConvId, { role: 'user', content: userQuestion });
+      pushRagSessionTurn(askConvId, { role: 'assistant', content: result.finalText });
+
+      currentPanel.postAssistantResult(askConvId, userQuestion, result, false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      output.appendLine(`[RAG ERROR] ${message}`);
+      ragConversationStore.appendUserMessage(askConvId, userQuestion, []);
+      ragConversationStore.appendInfoMessage(askConvId, message);
+      pushRagSessionTurn(askConvId, { role: 'user', content: userQuestion });
       currentPanel.postInfo(message);
       vscode.window.showErrorMessage(message);
     }
@@ -280,9 +355,91 @@ export function activate(context: vscode.ExtensionContext): void {
     return panel;
   };
 
+  const openRagPanel = (): RagChatPanel => {
+    ragPanel = RagChatPanel.createOrShow(context);
+
+    ragPanelMessageDisposable?.dispose();
+    ragPanelMessageDisposable = ragPanel.onDidReceiveMessage(async (message: Record<string, unknown>) => {
+      if (message.type === 'webview-ready') {
+        ragPanel!.postBootstrap(ragConversationStore.getBootstrapPayload());
+        refreshRagPanelTitle(ragPanel!);
+        return;
+      }
+      if (message.type === 'conversation/create') {
+        const snap = ragConversationStore.createConversation();
+        ragSessionContextMap.set(snap.meta.id, []);
+        pushRagConversationListUpdate(ragPanel!);
+        ragPanel!.postConversationActivate(snap.meta.id, []);
+        refreshRagPanelTitle(ragPanel!);
+        return;
+      }
+      if (message.type === 'conversation/select' && typeof message.id === 'string') {
+        ragConversationStore.setActive(message.id);
+        syncRagSessionContextFromStore(message.id);
+        const msgs = ragConversationStore.getMessagesForConversation(message.id);
+        ragPanel!.postConversationActivate(message.id, msgs);
+        refreshRagPanelTitle(ragPanel!);
+        return;
+      }
+      if (message.type === 'conversation/rename' && typeof message.id === 'string') {
+        const convId = message.id;
+        const directTitle = typeof message.title === 'string' ? message.title.trim() : '';
+        let titleToApply = directTitle;
+        if (!titleToApply) {
+          const existing = ragConversationStore.getConversation(convId);
+          const next = await vscode.window.showInputBox({
+            prompt: '会话名称',
+            value: existing?.meta.title ?? ''
+          });
+          if (next === undefined) {
+            return;
+          }
+          titleToApply = next;
+        }
+        ragConversationStore.renameConversation(convId, titleToApply);
+        pushRagConversationListUpdate(ragPanel!);
+        if (convId === ragConversationStore.getActiveId()) {
+          refreshRagPanelTitle(ragPanel!);
+        }
+        return;
+      }
+      if (message.type === 'conversation/delete' && typeof message.id === 'string') {
+        const convId = message.id;
+        const confirmDelete = await vscode.window.showWarningMessage(
+          '确定删除此会话？',
+          { modal: true },
+          '删除'
+        );
+        if (confirmDelete !== '删除') {
+          return;
+        }
+        ragConversationStore.deleteConversation(convId);
+        ragSessionContextMap.delete(convId);
+        const boot = ragConversationStore.getBootstrapPayload();
+        pushRagConversationListUpdate(ragPanel!);
+        ragPanel!.postConversationActivate(boot.activeId, boot.activeMessages);
+        syncRagSessionContextFromStore(boot.activeId);
+        refreshRagPanelTitle(ragPanel!);
+        return;
+      }
+      if (message.type === 'rag-ask') {
+        const p = message.payload as { question?: string };
+        if (!p?.question?.trim()) {
+          return;
+        }
+        await runRagAsk(p.question.trim());
+      }
+    });
+
+    return ragPanel;
+  };
+
   context.subscriptions.push(
     vscode.commands.registerCommand('alertMcp.openConsole', () => {
       openPanel();
+    }),
+    vscode.commands.registerCommand('alertMcp.openRagConsole', () => {
+      openRagPanel();
     }),
     vscode.commands.registerCommand('alertMcp.connectMcp', connectMcp),
     vscode.commands.registerCommand('alertMcp.disconnectMcp', async () => {

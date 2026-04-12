@@ -15,6 +15,99 @@
 
 ---
 
+## 2026-04-11 — 【汇总】扩展 RAG Console、Tavily 检索、fetch_data Trace 与 MCP 取数摘要（本轮）
+
+- **范围（VS Code 扩展）**：[`alert-mcp-vscode-extension/`](e:\edwin\AIGC\askoem\alert-mcp-vscode-extension) 内 `extension.ts`、`views/chatPanel.ts`、`chatPanelHtml.ts`、`chatPanelTypes.ts`、`ragChatPanel.ts`、`services/conversationStore.ts`、`oracleDocSearchService.ts`、`secretStorageService.ts`、`orchestration/ragOrchestrator.ts`、`orchestration/assistantOrchestrator.ts`、`views/opsSidebarProvider.ts`、`views/settingsPanel.ts`、`services/settingsService.ts`、`types/appTypes.ts`、`package.json`；脚本 [`scripts/gen_chat_panel_html.py`](e:\edwin\AIGC\askoem\alert-mcp-vscode-extension\scripts\gen_chat_panel_html.py)（可选，用于从 `chatPanel` 再生成 HTML 模板）。
+
+- **范围（后端 / MCP，与取数摘要同轮）**：[`src/service.py`](e:\edwin\AIGC\askoem\src\service.py)、[`src/mcp_server.py`](e:\edwin\AIGC\askoem\src\mcp_server.py)；测试 [`tests/test_fetch_fact_summary.py`](e:\edwin\AIGC\askoem\tests\test_fetch_fact_summary.py) 等（细目见本文件同日期各条）。
+
+- **目标**：在 OEM 控制台外提供独立 **RAG Console**；检索仅 **Oracle 英文文档树**与 **Oracle Blogs**；**不削弱** `fetch_data_from_oem` 在 **Tool Execution Trace** 中的完整 `report`（含 SQL 追踪）；取数侧保留客观 **`result_summary`** 与可选 **`llm_summary`**。
+
+- **结论（按能力）**：
+
+  | 能力 | 要点 |
+  |------|------|
+  | **独立 RAG 面板** | `RagChatPanel`（`alertMcpRagConsole`），`ConversationStore(..., oemAssistant.ragConversations.v1)`，命令 `alertMcp.openRagConsole`；**Operations** 树与视图标题栏均可打开。 |
+  | **共享 Webview HTML** | `buildChatPanelHtml({ mode: 'oem' \| 'rag' })`；RAG 隐藏 MCP 工具/图表/`@`；消息 **`rag-ask`**；助手 **`referenceLinks`** → 气泡下「相关文档」。 |
+  | **Tavily 检索** | `searchOracleRagViaTavily` → [Tavily Search API](https://api.tavily.com/search)；`include_domains: docs.oracle.com, blogs.oracle.com`；**`isAllowedOracleRagUrl`** 二次过滤（docs 仅 **`/en/`** 路径树，blogs 全站）。密钥 **`SecretStorage`**（`getTavilyApiKey` / `setTavilyApiKey`）；**Settings** 面板「**RAG（Oracle 文档 / 博客）**」密码框配置。已**移除** `alertMcp.rag.googleApiKey`、`alertMcp.rag.googleCx`。 |
+  | **Trace 与主回答分离** | 工具结果步骤 **`detail`** → **`formatToolResultForExecutionTrace`**（优先完整 **`report`**）；气泡/链式最终正文仍用 **`formatToolResultForDisplay`**（优先 **`llm_summary`**）。 |
+  | **MCP 取数** | `result_summary`、报告内【数据摘要】；成功返回 **`llm_summary`** 时 **`result`** 优先 LLM 文案；扩展工具展示层对 `llm_summary` 的优先级逻辑见 `assistantOrchestrator`（与 Trace 全量 `report` 不冲突）。 |
+
+- **备注**：扩展修改后 **重新加载窗口/扩展**；Python/MCP 修改后 **重启 MCP**；Tavily Key 仅在 **OEM Assistant Settings** 中保存，不写进 `settings.json` 明文项。
+
+---
+
+## 2026-04-11 — VS Code 扩展：独立「RAG Console」与 docs.oracle.com 检索
+
+- **范围**：[`alert-mcp-vscode-extension/src/extension.ts`](e:\edwin\AIGC\askoem\alert-mcp-vscode-extension\src\extension.ts)、[`alert-mcp-vscode-extension/src/views/ragChatPanel.ts`](e:\edwin\AIGC\askoem\alert-mcp-vscode-extension\src\views\ragChatPanel.ts)、[`alert-mcp-vscode-extension/src/views/chatPanelHtml.ts`](e:\edwin\AIGC\askoem\alert-mcp-vscode-extension\src\views\chatPanelHtml.ts)、[`alert-mcp-vscode-extension/src/services/conversationStore.ts`](e:\edwin\AIGC\askoem\alert-mcp-vscode-extension\src\services\conversationStore.ts)、[`alert-mcp-vscode-extension/src/services/oracleDocSearchService.ts`](e:\edwin\AIGC\askoem\alert-mcp-vscode-extension\src\services\oracleDocSearchService.ts)、[`alert-mcp-vscode-extension/src/orchestration/ragOrchestrator.ts`](e:\edwin\AIGC\askoem\alert-mcp-vscode-extension\src\orchestration\ragOrchestrator.ts)、[`alert-mcp-vscode-extension/package.json`](e:\edwin\AIGC\askoem\alert-mcp-vscode-extension\package.json)
+
+- **问题 / 目标**：在 OEM 控制台之外增加独立 Webview「RAG Console」；会话列表/持久化与 OEM 隔离；问答不依赖 MCP；助手气泡底部展示真实文档链接；未来可替换检索后端为向量 RAG。
+
+- **结论**：
+  1. **`ConversationStore`** 支持第二个参数 **`storageKey`**；RAG 使用 **`oemAssistant.ragConversations.v1`**。
+  2. **命令** `alertMcp.openRagConsole`（侧栏与命令面板）；**`RagChatPanel`**（webview id `alertMcpRagConsole`）与 **`ChatPanel`** 可并存。
+  3. **UI**：`buildChatPanelHtml({ mode: 'oem' | 'rag' })` 共享布局；RAG 模式隐藏 MCP 工具、图表与 `@` 提及；发送 **`rag-ask`**。
+  4. **检索后端**：后续条目已改为 **Tavily**（见下方「RAG：Google CSE 改为 Tavily」）；本条不再描述 Google CSE。
+  5. **`RagOrchestrator`**：读取 **`SecretStorage` LLM Key** 与 **Tavily Key**；抓取前 N 页 HTML 或 Tavily `content`；LLM 输出 JSON `{ answer, references }`，**`AssistantResult.referenceLinks`** 在 **「相关文档」**区渲染。
+  6. **settings**：`alertMcp.rag.searchTopK`、`snippetMaxChars`、`fetchSnippetPages`；Tavily Key 在 **Settings 面板「RAG」**。
+
+- **备注**：修改后**重新加载扩展**。
+
+---
+
+## 2026-04-11 — RAG：Google CSE 改为 Tavily；Settings 增加 Tavily API Key
+
+- **范围**：[`alert-mcp-vscode-extension/src/services/oracleDocSearchService.ts`](e:\edwin\AIGC\askoem\alert-mcp-vscode-extension\src\services\oracleDocSearchService.ts)、[`alert-mcp-vscode-extension/src/orchestration/ragOrchestrator.ts`](e:\edwin\AIGC\askoem\alert-mcp-vscode-extension\src\orchestration\ragOrchestrator.ts)、[`alert-mcp-vscode-extension/src/services/secretStorageService.ts`](e:\edwin\AIGC\askoem\alert-mcp-vscode-extension\src\services\secretStorageService.ts)、[`alert-mcp-vscode-extension/src/views/settingsPanel.ts`](e:\edwin\AIGC\askoem\alert-mcp-vscode-extension\src\views\settingsPanel.ts)、[`alert-mcp-vscode-extension/package.json`](e:\edwin\AIGC\askoem\alert-mcp-vscode-extension\package.json)
+
+- **问题 / 目标**：用 [Tavily Search](https://api.tavily.com/search) 替代 Google CSE；密钥在 **Settings 面板「RAG」** 中配置并写入 **SecretStorage**；检索范围仅 **https://docs.oracle.com/en/** 与 **https://blogs.oracle.com/**（`include_domains` + URL 白名单）。
+
+- **结论**：删除 **`alertMcp.rag.googleApiKey` / `googleCx`** 配置项；**`searchOracleRagViaTavily`** 使用 `include_domains: ['docs.oracle.com','blogs.oracle.com']`，**`isAllowedOracleRagUrl`** 要求 docs 路径以 **`/en/`** 开头（或 `/en`）；**`getTavilyApiKey` / `setTavilyApiKey`**。
+
+---
+
+## 2026-04-11 — 扩展：fetch_data Tool Execution Trace 恢复完整 report；侧栏增加 Open Console RAG
+
+- **范围**：[`alert-mcp-vscode-extension/src/orchestration/assistantOrchestrator.ts`](e:\edwin\AIGC\askoem\alert-mcp-vscode-extension\src\orchestration\assistantOrchestrator.ts)、[`alert-mcp-vscode-extension/src/views/opsSidebarProvider.ts`](e:\edwin\AIGC\askoem\alert-mcp-vscode-extension\src\views\opsSidebarProvider.ts)
+
+- **问题 / 目标**：`fetch_data_from_oem` 的 JSON 含 `llm_summary` 时，Trace 曾只显示摘要导致 SQL 说明丢失；RAG 入口仅在视图标题栏，Operations 树中无项。
+
+- **结论**：新增 **`formatToolResultForExecutionTrace`**，工具结果步骤的 `detail` 一律用完整 **`report`**（含【SQL 执行追踪】）；主回答仍用 **`formatToolResultForDisplay`**（优先 `llm_summary`）。侧栏 **`Open Console RAG`** 树节点绑定 **`alertMcp.openRagConsole`**。
+
+---
+
+## 2026-04-11 — `fetch_data_from_oem`：LLM 总结（`llm_summary`）与面板仅展示 LLM 正文
+
+- **范围**：[`src/service.py`](e:\edwin\AIGC\askoem\src\service.py)、[`src/mcp_server.py`](e:\edwin\AIGC\askoem\src\mcp_server.py)、[`alert-mcp-vscode-extension/src/orchestration/assistantOrchestrator.ts`](e:\edwin\AIGC\askoem\alert-mcp-vscode-extension\src\orchestration\assistantOrchestrator.ts)、[`tests/test_fetch_fact_summary.py`](e:\edwin\AIGC\askoem\tests\test_fetch_fact_summary.py)
+
+- **问题 / 目标**：在客观摘要与数据片段基础上，用 LLM 生成**仅依据实际结果**的中文总结；扩展侧工具结果展示以 **LLM 正文为主**（有 `llm_summary` 时只显示该字段）。
+
+- **结论**：
+  1. **`AskOpsService.build_fetch_llm_summary`**：输入为用户问题、`build_fetch_data_fact_summary` 结果、`_compact_fetch_payload_for_llm`（JSON 片段，有截断）；使用 **LangChain + ChatOpenAI（DEEPSEEK_*** 环境变量）**，temperature=0；`need_follow_up` 或未配置 API Key 或调用异常时返回空串。
+  2. **MCP `fetch_data_from_oem` 成功**：返回 **`llm_summary`**；**`result`** = `llm_summary` 非空时为 LLM 文本，否则为 **`result_summary`**（客观摘要）。追问分支 **`llm_summary`** 为 `""`**，**`result`** 仍为追问文案。
+  3. **`execute_omr_sql` 成功**：同样返回 **`llm_summary`** / **`result`**（与上同逻辑）。
+  4. **扩展 `formatToolResultForDisplay`**：若 JSON 含非空 **`llm_summary`**，**只**返回该字符串；否则仍用 **`report`**。
+
+- **备注**：需配置 **`DEEPSEEK_API_KEY`** 才会生成非空 **`llm_summary`**；修改后重启 **MCP** 与**重新加载扩展**。
+
+---
+
+## 2026-04-11 — `fetch_data_from_oem`：客观数据摘要（`result_summary` + 报告内【数据摘要】）
+
+- **范围**：[`src/service.py`](e:\edwin\AIGC\askoem\src\service.py)、[`src/mcp_server.py`](e:\edwin\AIGC\askoem\src\mcp_server.py)、[`tests/test_fetch_fact_summary.py`](e:\edwin\AIGC\askoem\tests\test_fetch_fact_summary.py)、[`tests/test_service_omr_mode.py`](e:\edwin\AIGC\askoem\tests\test_service_omr_mode.py)
+
+- **问题 / 目标**：在取数成功后，基于返回结果给出**不编造**的总结（行数、列、数值 min/max、低基数去重等）；不调用 LLM。
+
+- **结论**：
+  1. 新增 **`AskOpsService.build_fetch_data_fact_summary`**（及 `_fact_summary_lines_for_rows`、`_fact_summary_auxiliary_lists`、`_fact_summary_incidents_events_only`）、模块级 **`_try_parse_float_cell`**。
+  2. **`build_fetch_tool_report`** 在【元信息】前增加 **【数据摘要】** 小节，内容与下述 `result_summary` 一致。
+  3. **MCP `fetch_data_from_oem`**：成功与「需追问」分支均返回 **`result_summary`** 字段。
+  4. **`execute_omr_sql`** 成功返回增加 **`result_summary`**（与 `report` 内摘要一致）。
+  5. **测试**：`test_fetch_fact_summary.py`；`test_service_omr_mode` 中 `run_skill` 断言改为包含 **`host01`**（与当前 builtin 表格输出一致）。
+
+- **备注**：修改后需**重启 MCP** 进程。摘要仍**不**包含根因诊断或处置建议；若需自然语言润色须另开开关与严格 prompt。
+
+---
+
 ## 2026-04-11 — NL2SQL（`nl2sql_engine.py`）：表空间阈值/利用率、ORA-01722 与模板收紧
 
 - **范围**：`src/nl2sql_engine.py`、`tests/test_nl2sql_engine.py`

@@ -14,6 +14,7 @@ interface SettingsViewState {
   hasLlmApiKey: boolean;
   hasMcpToken: boolean;
   hasOemPassword: boolean;
+  hasTavilyApiKey: boolean;
 }
 
 export class SettingsPanel {
@@ -79,7 +80,8 @@ export class SettingsPanel {
       oemUsername: settings.oem.username,
       hasLlmApiKey: Boolean(await secrets.getLlmApiKey()),
       hasMcpToken: Boolean(await secrets.getMcpBearerToken()),
-      hasOemPassword: Boolean(await secrets.getOemPassword())
+      hasOemPassword: Boolean(await secrets.getOemPassword()),
+      hasTavilyApiKey: Boolean(await secrets.getTavilyApiKey())
     };
 
     this.panel.webview.postMessage({ type: 'state', payload: state });
@@ -124,6 +126,11 @@ export class SettingsPanel {
     const oemPassword = String(payload.oemPassword ?? '').trim();
     if (oemPassword) {
       await secrets.setOemPassword(oemPassword);
+    }
+
+    const tavilyApiKey = String(payload.tavilyApiKey ?? '').trim();
+    if (tavilyApiKey) {
+      await secrets.setTavilyApiKey(tavilyApiKey);
     }
 
     await this.refresh(settingsService, secrets);
@@ -337,6 +344,16 @@ export class SettingsPanel {
     </div>
 
     <div class="card">
+      <div class="section-title">RAG（Oracle 文档 / 博客）</div>
+      <p class="subtitle" style="margin: 0 0 10px 0;">检索仅允许 <strong>docs.oracle.com/en/</strong> 与 <strong>blogs.oracle.com</strong>（Tavily <code>include_domains</code> + URL 二次过滤）。</p>
+      <div class="grid">
+        <label class="field full">Tavily API Key（留空表示不修改）
+          <input id="tavilyApiKey" type="password" placeholder="tvly-..." />
+        </label>
+      </div>
+    </div>
+
+    <div class="card">
       <div class="section-title">Security</div>
       <div class="grid">
         <label class="field full">MCP Bearer Token（留空表示不修改）
@@ -355,7 +372,7 @@ export class SettingsPanel {
 
     const fields = [
       'mcpServerUrl', 'mcpConnectionMode', 'llmProvider', 'llmBaseUrl', 'llmModel', 'llmTemperature',
-      'llmApiKey', 'oemBaseUrl', 'oemUsername', 'oemPassword', 'mcpBearerToken'
+      'llmApiKey', 'oemBaseUrl', 'oemUsername', 'oemPassword', 'tavilyApiKey', 'mcpBearerToken'
     ];
 
     document.getElementById('saveBtn').addEventListener('click', () => {
@@ -384,12 +401,14 @@ export class SettingsPanel {
 
       document.getElementById('llmApiKey').value = '';
       document.getElementById('oemPassword').value = '';
+      document.getElementById('tavilyApiKey').value = '';
       document.getElementById('mcpBearerToken').value = '';
 
       const hints = [];
       if (state.hasLlmApiKey) hints.push('LLM Key已保存');
       if (state.hasMcpToken) hints.push('MCP Token已保存');
       if (state.hasOemPassword) hints.push('OEM密码已保存');
+      if (state.hasTavilyApiKey) hints.push('Tavily Key已保存');
       document.getElementById('secretHint').textContent = hints.join(' | ');
     });
   </script>

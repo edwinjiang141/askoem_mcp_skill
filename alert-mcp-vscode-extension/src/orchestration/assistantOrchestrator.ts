@@ -199,7 +199,7 @@ export class AssistantOrchestrator {
 
         const toolResult = await this.mcp.callTool(toolName, resolvedArgs);
         const toolResultForLlm = this.prepareToolResultContentForLlm(toolResult);
-        const toolResultDisplay = this.redactSensitiveText(this.formatToolResultForDisplay(toolResult));
+        const toolResultDisplay = this.redactSensitiveText(this.formatToolResultForExecutionTrace(toolResult));
         const resultStep: ExecutionStep = {
           type: 'tool-result',
           title: `Tool result: ${toolName}`,
@@ -343,7 +343,7 @@ export class AssistantOrchestrator {
         };
       }
 
-      const safeResult = this.redactSensitiveText(this.formatToolResultForDisplay(lastResult));
+      const safeResult = this.redactSensitiveText(this.formatToolResultForExecutionTrace(lastResult));
       const chainResultStep: ExecutionStep = {
         type: 'tool-result',
         title: `Tool result: ${toolName}`,
@@ -552,7 +552,7 @@ export class AssistantOrchestrator {
         {
           type: 'tool-result',
           title: `Tool result: ${loginToolName}`,
-          detail: this.redactSensitiveText(this.formatToolResultForDisplay(toolResult))
+          detail: this.redactSensitiveText(this.formatToolResultForExecutionTrace(toolResult))
         }
       ]
     };
@@ -594,7 +594,7 @@ export class AssistantOrchestrator {
 
   /**
    * 从报告正文中移除「SQL 执行追踪」整段（保留至「状态」前），供 Assistant 回复与 LLM 上下文使用；
-   * Tool Execution Trace 仍使用 formatToolResultForDisplay 的完整 report。
+   * Tool Execution Trace 使用 formatToolResultForExecutionTrace 的完整 report（含 SQL）。
    */
   private stripSqlExecutionTraceFromReportText(text: string): string {
     const t = String(text ?? '');
@@ -628,7 +628,27 @@ export class AssistantOrchestrator {
   }
 
   /**
-   * MCP 工具若返回 JSON 且含 report 字段，优先展示纯文本报告（含 SQL 执行追踪），避免整段 JSON 难读。
+   * Tool Execution Trace：始终优先展示完整 `report`（含【SQL 执行追踪】），不改为仅 llm_summary。
+   * 若无 `report` 则回退为格式化后的整段 JSON，避免 Trace 中丢失字段。
+   */
+  private formatToolResultForExecutionTrace(raw: string): string {
+    const trimmed = raw.trim();
+    if (!trimmed.startsWith('{')) {
+      return raw;
+    }
+    try {
+      const obj = JSON.parse(trimmed) as Record<string, unknown>;
+      if (typeof obj.report === 'string' && obj.report.trim().length > 0) {
+        return obj.report.trim();
+      }
+      return JSON.stringify(obj, null, 2);
+    } catch {
+      return raw;
+    }
+  }
+
+  /**
+   * 主回答区 / 链式最终正文：有 llm_summary 时优先短摘要；否则用 report。
    */
   private formatToolResultForDisplay(raw: string): string {
     const trimmed = raw.trim();
@@ -637,6 +657,9 @@ export class AssistantOrchestrator {
     }
     try {
       const obj = JSON.parse(trimmed) as Record<string, unknown>;
+      if (typeof obj.llm_summary === 'string' && obj.llm_summary.trim().length > 0) {
+        return obj.llm_summary.trim();
+      }
       if (typeof obj.report === 'string' && obj.report.trim().length > 0) {
         return obj.report.trim();
       }

@@ -9,7 +9,8 @@ import type {
   StoredChatMessage
 } from '../types/appTypes';
 
-const STORAGE_KEY = 'oemAssistant.conversations.v1';
+export const OEM_CONVERSATIONS_STORAGE_KEY = 'oemAssistant.conversations.v1';
+export const RAG_CONVERSATIONS_STORAGE_KEY = 'oemAssistant.ragConversations.v1';
 
 interface PersistedShape {
   conversations: ConversationSnapshot[];
@@ -34,10 +35,13 @@ export function messagesToChatTurns(messages: StoredChatMessage[]): ChatTurn[] {
 }
 
 export class ConversationStore {
-  constructor(private readonly context: vscode.ExtensionContext) {}
+  constructor(
+    private readonly context: vscode.ExtensionContext,
+    private readonly storageKey: string = OEM_CONVERSATIONS_STORAGE_KEY
+  ) {}
 
   private load(): PersistedShape {
-    const raw = this.context.globalState.get<PersistedShape | undefined>(STORAGE_KEY);
+    const raw = this.context.globalState.get<PersistedShape | undefined>(this.storageKey);
     if (raw && Array.isArray(raw.conversations)) {
       return {
         conversations: raw.conversations,
@@ -49,7 +53,7 @@ export class ConversationStore {
 
   private save(state: PersistedShape): void {
     try {
-      void this.context.globalState.update(STORAGE_KEY, state);
+      void this.context.globalState.update(this.storageKey, state);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       void vscode.window.showErrorMessage(

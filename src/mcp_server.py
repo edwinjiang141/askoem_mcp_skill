@@ -58,6 +58,7 @@ def fetch_data_from_oem(
         password=password,
     )
     if fetched.need_follow_up:
+        rs = service.build_fetch_data_fact_summary(fetched)
         return {
             "ok": False,
             "session_id": fetched.session_id,
@@ -65,7 +66,11 @@ def fetch_data_from_oem(
             "sql_source": fetched.sql_source,
             "result": fetched.follow_up_question,
             "report": service.build_fetch_tool_report(fetched, question),
+            "result_summary": rs,
+            "llm_summary": "",
         }
+    rs = service.build_fetch_data_fact_summary(fetched)
+    llm_text = service.build_fetch_llm_summary(question, fetched)
     out: dict[str, Any] = {
         "ok": True,
         "session_id": fetched.session_id,
@@ -91,6 +96,9 @@ def fetch_data_from_oem(
             "events": fetched.events,
         },
         "report": service.build_fetch_tool_report(fetched, question),
+        "result_summary": rs,
+        "llm_summary": llm_text,
+        "result": llm_text if llm_text else rs,
     }
     if fetched.omr_sub_queries:
         out["multi_query"] = True

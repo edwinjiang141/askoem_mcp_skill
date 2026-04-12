@@ -533,7 +533,7 @@ __export(extension_exports, {
   activate: () => activate
 });
 module.exports = __toCommonJS(extension_exports);
-var vscode7 = __toESM(require("vscode"));
+var vscode8 = __toESM(require("vscode"));
 
 // src/commands/commandHelpers.ts
 var vscode = __toESM(require("vscode"));
@@ -1733,7 +1733,7 @@ var AssistantOrchestrator = class {
         });
         const toolResult = await this.mcp.callTool(toolName, resolvedArgs);
         const toolResultForLlm = this.prepareToolResultContentForLlm(toolResult);
-        const toolResultDisplay = this.redactSensitiveText(this.formatToolResultForDisplay(toolResult));
+        const toolResultDisplay = this.redactSensitiveText(this.formatToolResultForExecutionTrace(toolResult));
         const resultStep = {
           type: "tool-result",
           title: `Tool result: ${toolName}`,
@@ -1853,7 +1853,7 @@ var AssistantOrchestrator = class {
           steps
         };
       }
-      const safeResult = this.redactSensitiveText(this.formatToolResultForDisplay(lastResult));
+      const safeResult = this.redactSensitiveText(this.formatToolResultForExecutionTrace(lastResult));
       const chainResultStep = {
         type: "tool-result",
         title: `Tool result: ${toolName}`,
@@ -1994,7 +1994,7 @@ var AssistantOrchestrator = class {
         {
           type: "tool-result",
           title: `Tool result: ${loginToolName}`,
-          detail: this.redactSensitiveText(this.formatToolResultForDisplay(toolResult))
+          detail: this.redactSensitiveText(this.formatToolResultForExecutionTrace(toolResult))
         }
       ]
     };
@@ -2025,7 +2025,7 @@ var AssistantOrchestrator = class {
   }
   /**
    * 从报告正文中移除「SQL 执行追踪」整段（保留至「状态」前），供 Assistant 回复与 LLM 上下文使用；
-   * Tool Execution Trace 仍使用 formatToolResultForDisplay 的完整 report。
+   * Tool Execution Trace 使用 formatToolResultForExecutionTrace 的完整 report（含 SQL）。
    */
   stripSqlExecutionTraceFromReportText(text) {
     const t = String(text ?? "");
@@ -2056,7 +2056,26 @@ var AssistantOrchestrator = class {
     return this.redactSensitiveText(raw);
   }
   /**
-   * MCP 工具若返回 JSON 且含 report 字段，优先展示纯文本报告（含 SQL 执行追踪），避免整段 JSON 难读。
+   * Tool Execution Trace：始终优先展示完整 `report`（含【SQL 执行追踪】），不改为仅 llm_summary。
+   * 若无 `report` 则回退为格式化后的整段 JSON，避免 Trace 中丢失字段。
+   */
+  formatToolResultForExecutionTrace(raw) {
+    const trimmed = raw.trim();
+    if (!trimmed.startsWith("{")) {
+      return raw;
+    }
+    try {
+      const obj = JSON.parse(trimmed);
+      if (typeof obj.report === "string" && obj.report.trim().length > 0) {
+        return obj.report.trim();
+      }
+      return JSON.stringify(obj, null, 2);
+    } catch {
+      return raw;
+    }
+  }
+  /**
+   * 主回答区 / 链式最终正文：有 llm_summary 时优先短摘要；否则用 report。
    */
   formatToolResultForDisplay(raw) {
     const trimmed = raw.trim();
@@ -2065,6 +2084,9 @@ var AssistantOrchestrator = class {
     }
     try {
       const obj = JSON.parse(trimmed);
+      if (typeof obj.llm_summary === "string" && obj.llm_summary.trim().length > 0) {
+        return obj.llm_summary.trim();
+      }
       if (typeof obj.report === "string" && obj.report.trim().length > 0) {
         return obj.report.trim();
       }
@@ -2084,7 +2106,8 @@ var AssistantOrchestrator = class {
 // src/services/conversationStore.ts
 var vscode2 = __toESM(require("vscode"));
 var import_node_crypto = require("node:crypto");
-var STORAGE_KEY = "oemAssistant.conversations.v1";
+var OEM_CONVERSATIONS_STORAGE_KEY = "oemAssistant.conversations.v1";
+var RAG_CONVERSATIONS_STORAGE_KEY = "oemAssistant.ragConversations.v1";
 function now() {
   return Date.now();
 }
@@ -2100,12 +2123,14 @@ function messagesToChatTurns(messages) {
   return turns;
 }
 var ConversationStore = class {
-  constructor(context) {
+  constructor(context, storageKey = OEM_CONVERSATIONS_STORAGE_KEY) {
     this.context = context;
+    this.storageKey = storageKey;
   }
   context;
+  storageKey;
   load() {
-    const raw = this.context.globalState.get(STORAGE_KEY);
+    const raw = this.context.globalState.get(this.storageKey);
     if (raw && Array.isArray(raw.conversations)) {
       return {
         conversations: raw.conversations,
@@ -2116,7 +2141,7 @@ var ConversationStore = class {
   }
   save(state) {
     try {
-      void this.context.globalState.update(STORAGE_KEY, state);
+      void this.context.globalState.update(this.storageKey, state);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       void vscode2.window.showErrorMessage(
@@ -2295,6 +2320,7 @@ var SecretStorageService = class _SecretStorageService {
   static LLM_API_KEY = "alertMcp.llm.apiKey";
   static MCP_BEARER_TOKEN = "alertMcp.mcp.bearerToken";
   static OEM_PASSWORD = "alertMcp.oem.password";
+  static TAVILY_API_KEY = "alertMcp.rag.tavilyApiKey";
   async getLlmApiKey() {
     return this.context.secrets.get(_SecretStorageService.LLM_API_KEY);
   }
@@ -2312,6 +2338,12 @@ var SecretStorageService = class _SecretStorageService {
   }
   async setOemPassword(value) {
     await this.context.secrets.store(_SecretStorageService.OEM_PASSWORD, value);
+  }
+  async getTavilyApiKey() {
+    return this.context.secrets.get(_SecretStorageService.TAVILY_API_KEY);
+  }
+  async setTavilyApiKey(value) {
+    await this.context.secrets.store(_SecretStorageService.TAVILY_API_KEY, value);
   }
 };
 
@@ -2339,6 +2371,11 @@ var SettingsService = class {
       oem: {
         baseUrl: config2.get("oem.baseUrl", ""),
         username: config2.get("oem.username", "")
+      },
+      rag: {
+        searchTopK: config2.get("rag.searchTopK", 8),
+        snippetMaxChars: config2.get("rag.snippetMaxChars", 6e3),
+        fetchSnippetPages: config2.get("rag.fetchSnippetPages", 3)
       }
     };
   }
@@ -19789,89 +19826,282 @@ ${structured}`);
   }
 };
 
+// src/services/oracleDocSearchService.ts
+function isAllowedOracleRagUrl(url2) {
+  try {
+    const u = new URL(url2);
+    if (u.protocol !== "https:") {
+      return false;
+    }
+    const h = u.hostname.toLowerCase();
+    if (h === "blogs.oracle.com") {
+      return true;
+    }
+    if (h === "docs.oracle.com") {
+      return u.pathname === "/en" || u.pathname.startsWith("/en/");
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+function stripHtmlToText(html) {
+  return html.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+}
+async function fetchPageSnippet(url2, maxChars, fetchImpl) {
+  const res = await fetchImpl(url2, {
+    method: "GET",
+    headers: {
+      "User-Agent": "OEM-Assistant-RAG/0.1 (VSCode extension)",
+      Accept: "text/html,application/xhtml+xml"
+    }
+  });
+  if (!res.ok) {
+    return `[fetch failed: ${res.status}]`;
+  }
+  const html = await res.text();
+  const text = stripHtmlToText(html);
+  return text.length > maxChars ? `${text.slice(0, maxChars)}
+\u2026` : text;
+}
+async function searchOracleRagViaTavily(query, apiKey, maxResults, fetchImpl = fetch) {
+  const n = Math.min(Math.max(1, maxResults), 20);
+  const res = await fetchImpl("https://api.tavily.com/search", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      api_key: apiKey,
+      query: query.trim(),
+      search_depth: "basic",
+      max_results: n,
+      include_domains: ["docs.oracle.com", "blogs.oracle.com"]
+    })
+  });
+  const rawText = await res.text();
+  let json2;
+  try {
+    json2 = JSON.parse(rawText);
+  } catch {
+    throw new Error(`Tavily response is not JSON: ${rawText.slice(0, 200)}`);
+  }
+  if (!res.ok) {
+    const detail = typeof json2.message === "string" ? json2.message : json2.error ?? rawText.slice(0, 300);
+    throw new Error(`Tavily search failed: ${res.status} ${detail}`);
+  }
+  const out = [];
+  for (const r of json2.results ?? []) {
+    const link = typeof r.url === "string" ? r.url.trim() : "";
+    const title = typeof r.title === "string" ? r.title.trim() : link;
+    if (!link || !isAllowedOracleRagUrl(link)) {
+      continue;
+    }
+    const sn = typeof r.content === "string" ? r.content.trim() : "";
+    out.push({
+      title: title || link,
+      url: link,
+      ...sn ? { snippet: sn.length > 12e3 ? `${sn.slice(0, 12e3)}\u2026` : sn } : {}
+    });
+  }
+  return out;
+}
+
+// src/orchestration/ragOrchestrator.ts
+function parseJsonObjectFromLlm(text) {
+  const trimmed = text.trim();
+  const fence = /^```(?:json)?\s*([\s\S]*?)```$/m.exec(trimmed);
+  const raw = fence ? fence[1].trim() : trimmed;
+  const parsed = JSON.parse(raw);
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    return parsed;
+  }
+  throw new Error("LLM output is not a JSON object.");
+}
+function normalizeReferences(raw, allowed) {
+  const allowSet = new Set(allowed.map((a) => a.url));
+  const byUrl = new Map(allowed.map((a) => [a.url, a]));
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  const out = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+    const rec = item;
+    const url2 = typeof rec.url === "string" ? rec.url.trim() : "";
+    if (!url2 || !allowSet.has(url2)) {
+      continue;
+    }
+    const meta3 = byUrl.get(url2);
+    const title = typeof rec.title === "string" && rec.title.trim() ? rec.title.trim() : meta3?.title ?? url2;
+    const sn = meta3?.snippet?.trim();
+    out.push(sn ? { title, url: url2, snippet: sn } : { title, url: url2 });
+  }
+  return out;
+}
+var RagOrchestrator = class {
+  constructor(settings, secrets, output, fetchImpl = fetch) {
+    this.settings = settings;
+    this.secrets = secrets;
+    this.output = output;
+    this.fetchImpl = fetchImpl;
+  }
+  settings;
+  secrets;
+  output;
+  fetchImpl;
+  async ask(userText, conversationContext = []) {
+    const apiKey = await this.secrets.getLlmApiKey();
+    if (!apiKey) {
+      throw new Error("LLM API key is not configured. Run: OEM Assistant: Set LLM API Key");
+    }
+    if (this.settings.llm.provider === "copilot") {
+      throw new Error("Copilot mode is reserved for a later version. Use openai-compatible.");
+    }
+    const tavilyKey = (await this.secrets.getTavilyApiKey())?.trim() ?? "";
+    if (!tavilyKey) {
+      return {
+        finalText: "\u672A\u914D\u7F6E Tavily API Key\u3002\u8BF7\u6253\u5F00 OEM Assistant Settings\uFF0C\u5728\u300CRAG\u300D\u4E2D\u586B\u5199 Tavily API Key\uFF08SecretStorage \u4FDD\u5B58\uFF09\u3002\u68C0\u7D22\u8303\u56F4\u4EC5 https://docs.oracle.com/en/ \u4E0E https://blogs.oracle.com/ \u3002\u914D\u7F6E\u540E\u91CD\u8BD5\u3002",
+        steps: [
+          {
+            type: "info",
+            title: "RAG",
+            detail: "\u4F7F\u7528 Tavily Search API\uFF08include_domains: docs.oracle.com\u3001blogs.oracle.com\uFF09\uFF0C\u7ED3\u679C\u518D\u6309 URL \u89C4\u5219\u8FC7\u6EE4\u4E3A\u4EC5 docs.oracle.com/en/ \u4E0E blogs.oracle.com\u3002"
+          }
+        ]
+      };
+    }
+    const topK = this.settings.rag.searchTopK;
+    const snippetPages = Math.max(0, Math.min(5, this.settings.rag.fetchSnippetPages));
+    const snippetMax = Math.max(500, this.settings.rag.snippetMaxChars);
+    let links;
+    try {
+      links = await searchOracleRagViaTavily(userText, tavilyKey, topK, this.fetchImpl);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      this.output.appendLine(`[RAG search] ${msg}`);
+      return {
+        finalText: `Oracle \u6587\u6863\u68C0\u7D22\u5931\u8D25\uFF1A${msg}`,
+        steps: [{ type: "error", title: "\u68C0\u7D22", detail: msg }]
+      };
+    }
+    if (links.length === 0) {
+      return {
+        finalText: "\u672A\u5728\u5141\u8BB8\u7AD9\u70B9\uFF08docs.oracle.com/en/ \u4E0E blogs.oracle.com\uFF09\u68C0\u7D22\u5230\u5339\u914D\u9875\u9762\u3002\u8BF7\u6362\u7528\u82F1\u6587\u5173\u952E\u8BCD\u3001\u4EA7\u54C1\u540D\u6216\u6587\u6863\u4E2D\u7684\u672F\u8BED\u540E\u91CD\u8BD5\u3002",
+        steps: [{ type: "info", title: "\u68C0\u7D22", detail: "0 results after Tavily + URL filter" }]
+      };
+    }
+    const snippetParts = [];
+    const slice = links.slice(0, snippetPages);
+    for (let i = 0; i < slice.length; i++) {
+      const u = slice[i].url;
+      try {
+        const sn = await fetchPageSnippet(u, Math.floor(snippetMax / Math.max(1, slice.length)), this.fetchImpl);
+        snippetParts.push(`--- Page ${i + 1}: ${u} ---
+${sn}`);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        snippetParts.push(`--- Page ${i + 1}: ${u} ---
+[snippet fetch failed: ${msg}]`);
+      }
+    }
+    let snippetsJoined = snippetParts.join("\n\n");
+    if (!snippetsJoined.trim()) {
+      snippetsJoined = links.map((l, i) => {
+        const sn = l.snippet?.trim() || "";
+        return `--- Tavily ${i + 1}: ${l.url} ---
+${sn || "(no snippet from search API)"}`;
+      }).join("\n\n");
+    }
+    const llm = new OpenAiCompatibleLlmService(
+      this.settings.llm.baseUrl,
+      apiKey,
+      this.settings.llm.model,
+      0.1
+    );
+    const allowedJson = JSON.stringify(links, null, 0);
+    const systemPrompt = [
+      "You answer using only the user question and the PROVIDED document excerpts and allowed link list.",
+      'Do not invent URLs. The "references" array may only contain objects whose "url" appears in the allowed list.',
+      "Respond in Chinese unless the user explicitly asked another language.",
+      "Output a single JSON object only, no markdown fence, with keys:",
+      '"answer" (string, markdown allowed in plain text only, no HTML tags)',
+      '"references" (array of { "title", "url" } subset of allowed links you cited).'
+    ].join("\n");
+    const userBlock = [
+      `User question:
+${userText}`,
+      "",
+      `Allowed links (title + url):
+${allowedJson}`,
+      "",
+      `Document excerpts:
+${snippetsJoined}`
+    ].join("\n");
+    const prior = conversationContext.slice(-12);
+    const messages = [
+      { role: "system", content: systemPrompt },
+      ...prior,
+      { role: "user", content: userBlock }
+    ];
+    const choice = await llm.complete(messages, []);
+    const content = choice.content?.trim();
+    if (!content) {
+      throw new Error("LLM returned empty content.");
+    }
+    let parsed;
+    try {
+      parsed = parseJsonObjectFromLlm(content);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      this.output.appendLine(`[RAG] JSON parse failed: ${msg}
+Raw: ${content.slice(0, 2e3)}`);
+      return {
+        finalText: "\u6A21\u578B\u672A\u8FD4\u56DE\u53EF\u89E3\u6790\u7684 JSON\u3002\u8BF7\u91CD\u8BD5\uFF1B\u82E5\u6301\u7EED\u5931\u8D25\uFF0C\u8BF7\u964D\u4F4E\u95EE\u9898\u957F\u5EA6\u6216\u68C0\u67E5\u6A21\u578B\u662F\u5426\u652F\u6301\u6307\u4EE4\u9075\u5FAA\u3002",
+        steps: [
+          { type: "error", title: "LLM", detail: msg },
+          { type: "info", title: "\u68C0\u7D22\u547D\u4E2D", detail: `${links.length} page(s) (Tavily, allowed URLs only)` }
+        ],
+        referenceLinks: links
+      };
+    }
+    const answer = typeof parsed.answer === "string" ? parsed.answer.trim() : "";
+    const refs = normalizeReferences(parsed.references, links);
+    if (!answer) {
+      return {
+        finalText: "\u6A21\u578B\u672A\u751F\u6210\u6709\u6548\u56DE\u7B54\u6B63\u6587\u3002\u8BF7\u91CD\u8BD5\u3002",
+        steps: [{ type: "info", title: "\u68C0\u7D22\u547D\u4E2D", detail: `${links.length} page(s)` }],
+        referenceLinks: links
+      };
+    }
+    return {
+      finalText: answer,
+      steps: [
+        {
+          type: "info",
+          title: "\u68C0\u7D22",
+          detail: `Tavily \u547D\u4E2D ${links.length} \u6761\uFF08\u5141\u8BB8\u7AD9\u70B9\u5185\uFF09\uFF1B\u7528\u4E8E HTML \u6458\u5F55 ${slice.length} \u9875\u3002`
+        }
+      ],
+      referenceLinks: refs.length > 0 ? refs : links
+    };
+  }
+};
+
 // src/views/chatPanel.ts
 var vscode4 = __toESM(require("vscode"));
-var ChatPanel = class _ChatPanel {
-  static current;
-  panel;
-  static createOrShow(context) {
-    if (_ChatPanel.current) {
-      _ChatPanel.current.panel.reveal(vscode4.ViewColumn.One);
-      return _ChatPanel.current;
-    }
-    const panel = vscode4.window.createWebviewPanel(
-      "alertMcpConsole",
-      "OEM Assistant Console",
-      vscode4.ViewColumn.One,
-      {
-        enableScripts: true,
-        retainContextWhenHidden: true,
-        localResourceRoots: [vscode4.Uri.joinPath(context.extensionUri, "media")]
-      }
-    );
-    _ChatPanel.current = new _ChatPanel(panel, context);
-    return _ChatPanel.current;
-  }
-  constructor(panel, context) {
-    this.panel = panel;
-    this.panel.onDidDispose(() => {
-      _ChatPanel.current = void 0;
-    });
-    const chartSrc = this.panel.webview.asWebviewUri(vscode4.Uri.joinPath(context.extensionUri, "media", "chart.umd.min.js")).toString();
-    const csp = [
-      `default-src 'none'`,
-      `style-src ${this.panel.webview.cspSource} 'unsafe-inline'`,
-      `script-src ${this.panel.webview.cspSource} 'unsafe-inline'`,
-      `img-src ${this.panel.webview.cspSource} data:`,
-      `font-src ${this.panel.webview.cspSource} data:`
-    ].join("; ");
-    this.panel.webview.html = this.renderHtml(chartSrc, csp);
-  }
-  onDidReceiveMessage(handler) {
-    return this.panel.webview.onDidReceiveMessage(handler);
-  }
-  setPanelTitle(title) {
-    const t = title.trim();
-    this.panel.title = t.length > 0 ? `OEM: ${t.length > 40 ? `${t.slice(0, 37)}...` : t}` : "OEM Assistant Console";
-  }
-  postBootstrap(payload) {
-    this.panel.webview.postMessage({ type: "conversations-bootstrap", payload });
-  }
-  postConversationActivate(activeId, messages) {
-    this.panel.webview.postMessage({
-      type: "conversation-activate",
-      payload: { activeId, messages }
-    });
-  }
-  postConversationListUpdate(items, activeId) {
-    this.panel.webview.postMessage({
-      type: "conversations-list",
-      payload: { items, activeId }
-    });
-  }
-  postAssistantResult(conversationId, question, result, showFetchDataCharts) {
-    this.panel.webview.postMessage({
-      type: "assistant-result",
-      payload: { conversationId, question, result, showFetchDataCharts }
-    });
-  }
-  postChartSettings(showFetchDataCharts) {
-    this.panel.webview.postMessage({ type: "chart-settings", payload: showFetchDataCharts });
-  }
-  postInfo(text) {
-    this.panel.webview.postMessage({ type: "info", payload: text });
-  }
-  postToolCatalog(tools) {
-    this.panel.webview.postMessage({ type: "tools-catalog", payload: tools });
-  }
-  renderHtml(chartSrc, csp) {
-    return `<!DOCTYPE html>
+
+// src/views/chatPanelHtml.ts
+function buildChatPanelHtml(options) {
+  const isOem = options.mode === "oem";
+  const { chartSrc, csp } = options;
+  return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta http-equiv="Content-Security-Policy" content="${csp.replace(/"/g, "&quot;")}" />
-  <title>OEM Assistant Console</title>
+  <title>${isOem ? "OEM Assistant Console" : "OEM RAG Console"}</title>
   <style>
     * { box-sizing: border-box; }
     body {
@@ -20170,6 +20400,30 @@ var ChatPanel = class _ChatPanel {
       margin-bottom: 8px;
       opacity: 0.9;
     }
+    .ref-links {
+      margin-top: 12px;
+      padding-top: 10px;
+      border-top: 1px dashed var(--vscode-panel-border);
+      font-size: 12px;
+    }
+    .ref-links-title {
+      font-weight: 600;
+      margin-bottom: 6px;
+      opacity: 0.9;
+    }
+    .ref-link-row {
+      margin: 4px 0;
+    }
+    .ref-link-row a {
+      color: var(--vscode-textLink-foreground);
+    }
+    .rag-top-hint {
+      font-size: 11px;
+      opacity: 0.85;
+      padding: 6px 0 8px 0;
+      border-bottom: 1px solid var(--vscode-panel-border);
+      margin-bottom: 8px;
+    }
   </style>
 </head>
 <body>
@@ -20181,27 +20435,31 @@ var ChatPanel = class _ChatPanel {
       <ul id="convList" class="conv-list" role="list"></ul>
     </aside>
     <div class="conv-main">
-      <div class="chart-toolbar">
+      <div class="chart-toolbar" style="${isOem ? "" : "display:none"}">
         <label class="chart-toggle-label" for="chartToggle">
           <input type="checkbox" id="chartToggle" checked />
           \u663E\u793A\u6570\u636E\u56FE\u8868
         </label>
         <span class="chart-hint">\u56FE\u8868\u5C55\u793A\u5728\u52A9\u624B\u56DE\u7B54\u6B63\u6587\u4E0B\u65B9\uFF1B\u5173\u95ED\u540E\u4EC5\u9690\u85CF\u56FE\u8868\u3002</span>
       </div>
+      <div class="rag-top-hint" style="${isOem ? "display:none" : ""}">
+        \u77E5\u8BC6\u68C0\u7D22\uFF1A\u4EC5 https://docs.oracle.com/en/ \u4E0E https://blogs.oracle.com/ \u3002\u8BF7\u5728 OEM Assistant Settings \u2192 RAG \u4E2D\u914D\u7F6E Tavily API Key\uFF08SecretStorage\uFF09\u3002
+      </div>
       <div id="log" class="chat-log"></div>
-      <div class="mention-wrap" id="mentions"></div>
+      <div class="mention-wrap" id="mentions" style="${isOem ? "" : "display:none"}"></div>
       <div class="composer">
-        <div id="toolPicker" class="tool-picker" role="listbox" aria-label="MCP tools"></div>
-        <textarea id="input" placeholder="\u8F93\u5165 @ \u53EF\u5FEB\u901F\u9009\u62E9 tool\uFF0C\u4F8B\u5982\uFF1A@fetch_data_from_oem \u67E5\u8BE2xx\u4E3B\u673ACPU\u544A\u8B66\u3002"></textarea>
+        <div id="toolPicker" class="tool-picker" role="listbox" aria-label="MCP tools" style="${isOem ? "" : "display:none"}"></div>
+        <textarea id="input" placeholder="${isOem ? "\u8F93\u5165 @ \u53EF\u5FEB\u901F\u9009\u62E9 tool\uFF0C\u4F8B\u5982\uFF1A@fetch_data_from_oem \u67E5\u8BE2xx\u4E3B\u673ACPU\u544A\u8B66\u3002" : "\u8F93\u5165\u5173\u4E8E Oracle \u6587\u6863\u7684\u95EE\u9898\uFF08\u82F1\u6587\u5173\u952E\u8BCD\u68C0\u7D22\u6548\u679C\u66F4\u7A33\uFF09\u3002"}"></textarea>
         <button id="askBtn" class="submit-btn" title="Submit">\u27A4</button>
       </div>
-      <div class="hint">\u63D0\u793A\uFF1A\u8F93\u5165 @tool_name \u53EF\u6307\u5B9A\u4F18\u5148\u8C03\u7528\u5DE5\u5177\uFF1BCtrl/Cmd+Enter \u53D1\u9001\u3002</div>
+      <div class="hint">${isOem ? "\u63D0\u793A\uFF1A\u8F93\u5165 @tool_name \u53EF\u6307\u5B9A\u4F18\u5148\u8C03\u7528\u5DE5\u5177\uFF1BCtrl/Cmd+Enter \u53D1\u9001\u3002" : "Ctrl/Cmd+Enter \u53D1\u9001\u3002"}</div>
     </div>
   </div>
 
-  <script src="${chartSrc}"></script>
+  ${isOem ? `<script src="${chartSrc}"></script>` : ""}
   <script>
     const vscode = acquireVsCodeApi();
+    const IS_OEM = ${isOem ? "true" : "false"};
     const input = document.getElementById('input');
     const log = document.getElementById('log');
     const picker = document.getElementById('toolPicker');
@@ -20237,6 +20495,10 @@ var ChatPanel = class _ChatPanel {
     }
 
     function redrawMentions() {
+      if (!IS_OEM) {
+        mentions.innerHTML = '';
+        return;
+      }
       const used = extractToolMentions(input.value);
       if (!used.length) {
         mentions.innerHTML = '';
@@ -20427,6 +20689,24 @@ var ChatPanel = class _ChatPanel {
       return { charts: out.slice(0, 10) };
     }
 
+    function appendReferenceLinks(wrapper, result) {
+      if (!result || !result.referenceLinks || !result.referenceLinks.length) {
+        return;
+      }
+      const box = document.createElement('div');
+      box.className = 'ref-links';
+      box.innerHTML =
+        '<div class="ref-links-title">\u76F8\u5173\u6587\u6863</div>' +
+        result.referenceLinks
+          .map(function (l) {
+            const u = escapeHtml(String(l.url || ''));
+            const t = escapeHtml(String(l.title || l.url || ''));
+            return '<div class="ref-link-row"><a href="' + u + '" target="_blank" rel="noopener noreferrer">' + t + '</a></div>';
+          })
+          .join('');
+      wrapper.appendChild(box);
+    }
+
     function renderAssistantBubble(result, skipTypewriter, messageShowCharts) {
       const settingsOk = messageShowCharts !== undefined ? messageShowCharts : showFetchDataCharts;
       const userWantsCharts = chartToggle ? chartToggle.checked : true;
@@ -20469,6 +20749,7 @@ var ChatPanel = class _ChatPanel {
           details.innerHTML = '<summary>Tool Execution Trace</summary>' + stepsHtml;
           wrapper.appendChild(details);
         }
+        appendReferenceLinks(wrapper, result);
         wrapper.scrollIntoView({ behavior: 'smooth', block: 'end' });
       };
 
@@ -20580,6 +20861,9 @@ var ChatPanel = class _ChatPanel {
     }
 
     function maybeShowPicker() {
+      if (!IS_OEM) {
+        return;
+      }
       const mention = getCurrentMentionQuery();
       if (!mention) {
         picker.classList.remove('visible');
@@ -20593,9 +20877,13 @@ var ChatPanel = class _ChatPanel {
     function submitAsk() {
       const question = input.value.trim();
       if (!question) return;
-      const preferredTools = extractToolMentions(question);
       appendBubble('user', 'You', '<div>' + escapeHtml(redactSensitiveText(question)) + '</div>');
-      vscode.postMessage({ type: 'ask', payload: { question, preferredTools } });
+      if (IS_OEM) {
+        const preferredTools = extractToolMentions(question);
+        vscode.postMessage({ type: 'ask', payload: { question, preferredTools } });
+      } else {
+        vscode.postMessage({ type: 'rag-ask', payload: { question } });
+      }
       input.value = '';
       mentions.innerHTML = '';
       picker.classList.remove('visible');
@@ -20744,14 +21032,165 @@ var ChatPanel = class _ChatPanel {
   </script>
 </body>
 </html>`;
+}
+
+// src/views/chatPanel.ts
+var ChatPanel = class _ChatPanel {
+  static current;
+  panel;
+  static createOrShow(context) {
+    if (_ChatPanel.current) {
+      _ChatPanel.current.panel.reveal(vscode4.ViewColumn.One);
+      return _ChatPanel.current;
+    }
+    const panel = vscode4.window.createWebviewPanel(
+      "alertMcpConsole",
+      "OEM Assistant Console",
+      vscode4.ViewColumn.One,
+      {
+        enableScripts: true,
+        retainContextWhenHidden: true,
+        localResourceRoots: [vscode4.Uri.joinPath(context.extensionUri, "media")]
+      }
+    );
+    _ChatPanel.current = new _ChatPanel(panel, context);
+    return _ChatPanel.current;
+  }
+  constructor(panel, context) {
+    this.panel = panel;
+    this.panel.onDidDispose(() => {
+      _ChatPanel.current = void 0;
+    });
+    const chartSrc = this.panel.webview.asWebviewUri(vscode4.Uri.joinPath(context.extensionUri, "media", "chart.umd.min.js")).toString();
+    const csp = [
+      `default-src 'none'`,
+      `style-src ${this.panel.webview.cspSource} 'unsafe-inline'`,
+      `script-src ${this.panel.webview.cspSource} 'unsafe-inline'`,
+      `img-src ${this.panel.webview.cspSource} data:`,
+      `font-src ${this.panel.webview.cspSource} data:`
+    ].join("; ");
+    this.panel.webview.html = this.renderHtml(chartSrc, csp);
+  }
+  onDidReceiveMessage(handler) {
+    return this.panel.webview.onDidReceiveMessage(handler);
+  }
+  setPanelTitle(title) {
+    const t = title.trim();
+    this.panel.title = t.length > 0 ? `OEM: ${t.length > 40 ? `${t.slice(0, 37)}...` : t}` : "OEM Assistant Console";
+  }
+  postBootstrap(payload) {
+    this.panel.webview.postMessage({ type: "conversations-bootstrap", payload });
+  }
+  postConversationActivate(activeId, messages) {
+    this.panel.webview.postMessage({
+      type: "conversation-activate",
+      payload: { activeId, messages }
+    });
+  }
+  postConversationListUpdate(items, activeId) {
+    this.panel.webview.postMessage({
+      type: "conversations-list",
+      payload: { items, activeId }
+    });
+  }
+  postAssistantResult(conversationId, question, result, showFetchDataCharts) {
+    this.panel.webview.postMessage({
+      type: "assistant-result",
+      payload: { conversationId, question, result, showFetchDataCharts }
+    });
+  }
+  postChartSettings(showFetchDataCharts) {
+    this.panel.webview.postMessage({ type: "chart-settings", payload: showFetchDataCharts });
+  }
+  postInfo(text) {
+    this.panel.webview.postMessage({ type: "info", payload: text });
+  }
+  postToolCatalog(tools) {
+    this.panel.webview.postMessage({ type: "tools-catalog", payload: tools });
+  }
+  renderHtml(chartSrc, csp) {
+    return buildChatPanelHtml({ mode: "oem", chartSrc, csp });
+  }
+};
+
+// src/views/ragChatPanel.ts
+var vscode5 = __toESM(require("vscode"));
+var RagChatPanel = class _RagChatPanel {
+  static current;
+  panel;
+  static createOrShow(context) {
+    if (_RagChatPanel.current) {
+      _RagChatPanel.current.panel.reveal(vscode5.ViewColumn.One);
+      return _RagChatPanel.current;
+    }
+    const panel = vscode5.window.createWebviewPanel(
+      "alertMcpRagConsole",
+      "OEM RAG Console",
+      vscode5.ViewColumn.One,
+      {
+        enableScripts: true,
+        retainContextWhenHidden: true,
+        localResourceRoots: [vscode5.Uri.joinPath(context.extensionUri, "media")]
+      }
+    );
+    _RagChatPanel.current = new _RagChatPanel(panel, context);
+    return _RagChatPanel.current;
+  }
+  constructor(panel, context) {
+    this.panel = panel;
+    this.panel.onDidDispose(() => {
+      _RagChatPanel.current = void 0;
+    });
+    const csp = [
+      `default-src 'none'`,
+      `style-src ${this.panel.webview.cspSource} 'unsafe-inline'`,
+      `script-src ${this.panel.webview.cspSource} 'unsafe-inline'`,
+      `img-src ${this.panel.webview.cspSource} data:`,
+      `font-src ${this.panel.webview.cspSource} data:`
+    ].join("; ");
+    this.panel.webview.html = this.renderHtml(csp);
+  }
+  onDidReceiveMessage(handler) {
+    return this.panel.webview.onDidReceiveMessage(handler);
+  }
+  setPanelTitle(title) {
+    const t = title.trim();
+    this.panel.title = t.length > 0 ? `OEM RAG: ${t.length > 40 ? `${t.slice(0, 37)}...` : t}` : "OEM RAG Console";
+  }
+  postBootstrap(payload) {
+    this.panel.webview.postMessage({ type: "conversations-bootstrap", payload });
+  }
+  postConversationActivate(activeId, messages) {
+    this.panel.webview.postMessage({
+      type: "conversation-activate",
+      payload: { activeId, messages }
+    });
+  }
+  postConversationListUpdate(items, activeId) {
+    this.panel.webview.postMessage({
+      type: "conversations-list",
+      payload: { items, activeId }
+    });
+  }
+  postAssistantResult(conversationId, question, result, _showFetchDataCharts) {
+    this.panel.webview.postMessage({
+      type: "assistant-result",
+      payload: { conversationId, question, result, showFetchDataCharts: false }
+    });
+  }
+  postInfo(text) {
+    this.panel.webview.postMessage({ type: "info", payload: text });
+  }
+  renderHtml(csp) {
+    return buildChatPanelHtml({ mode: "rag", chartSrc: "", csp });
   }
 };
 
 // src/views/opsSidebarProvider.ts
-var vscode5 = __toESM(require("vscode"));
-var SidebarItem = class extends vscode5.TreeItem {
+var vscode6 = __toESM(require("vscode"));
+var SidebarItem = class extends vscode6.TreeItem {
   constructor(label, options) {
-    super(label, options?.collapsibleState ?? vscode5.TreeItemCollapsibleState.None);
+    super(label, options?.collapsibleState ?? vscode6.TreeItemCollapsibleState.None);
     this.description = options?.description;
     this.command = options?.command;
     this.contextValue = options?.contextValue;
@@ -20765,7 +21204,7 @@ var OpsSidebarProvider = class {
   }
   mcp;
   settingsService;
-  onDidChangeTreeDataEmitter = new vscode5.EventEmitter();
+  onDidChangeTreeDataEmitter = new vscode6.EventEmitter();
   onDidChangeTreeData = this.onDidChangeTreeDataEmitter.event;
   refresh() {
     this.onDidChangeTreeDataEmitter.fire();
@@ -20810,7 +21249,7 @@ var OpsSidebarProvider = class {
       new SidebarItem("LLM Model", { description: settings.llm.model }),
       new SidebarItem("Available Tools", {
         description: `${tools.length}`,
-        collapsibleState: vscode5.TreeItemCollapsibleState.Expanded,
+        collapsibleState: vscode6.TreeItemCollapsibleState.Expanded,
         contextValue: "available-tools"
       }),
       new SidebarItem("Open Console", {
@@ -20818,6 +21257,13 @@ var OpsSidebarProvider = class {
         command: {
           command: "alertMcp.openConsole",
           title: "Open Console"
+        }
+      }),
+      new SidebarItem("Open Console RAG", {
+        description: "Oracle docs (docs.oracle.com) + LLM",
+        command: {
+          command: "alertMcp.openRagConsole",
+          title: "Open Console RAG"
         }
       }),
       new SidebarItem("Open Settings", {
@@ -20832,20 +21278,20 @@ var OpsSidebarProvider = class {
 };
 
 // src/views/settingsPanel.ts
-var vscode6 = __toESM(require("vscode"));
+var vscode7 = __toESM(require("vscode"));
 var SettingsPanel = class _SettingsPanel {
   static current;
   panel;
   static async createOrShow(context, settingsService, secrets) {
     if (_SettingsPanel.current) {
-      _SettingsPanel.current.panel.reveal(vscode6.ViewColumn.One);
+      _SettingsPanel.current.panel.reveal(vscode7.ViewColumn.One);
       await _SettingsPanel.current.refresh(settingsService, secrets);
       return _SettingsPanel.current;
     }
-    const panel = vscode6.window.createWebviewPanel(
+    const panel = vscode7.window.createWebviewPanel(
       "alertMcpSettings",
       "OEM Assistant Settings",
-      vscode6.ViewColumn.One,
+      vscode7.ViewColumn.One,
       {
         enableScripts: true,
         retainContextWhenHidden: true
@@ -20880,29 +21326,30 @@ var SettingsPanel = class _SettingsPanel {
       oemUsername: settings.oem.username,
       hasLlmApiKey: Boolean(await secrets.getLlmApiKey()),
       hasMcpToken: Boolean(await secrets.getMcpBearerToken()),
-      hasOemPassword: Boolean(await secrets.getOemPassword())
+      hasOemPassword: Boolean(await secrets.getOemPassword()),
+      hasTavilyApiKey: Boolean(await secrets.getTavilyApiKey())
     };
     this.panel.webview.postMessage({ type: "state", payload: state });
   }
   async handleSave(payload, settingsService, secrets) {
-    const config2 = vscode6.workspace.getConfiguration("alertMcp");
+    const config2 = vscode7.workspace.getConfiguration("alertMcp");
     await Promise.all([
-      config2.update("mcp.serverUrl", String(payload.mcpServerUrl ?? ""), vscode6.ConfigurationTarget.Global),
+      config2.update("mcp.serverUrl", String(payload.mcpServerUrl ?? ""), vscode7.ConfigurationTarget.Global),
       config2.update(
         "mcp.connectionMode",
         String(payload.mcpConnectionMode ?? "auto"),
-        vscode6.ConfigurationTarget.Global
+        vscode7.ConfigurationTarget.Global
       ),
-      config2.update("llm.provider", String(payload.llmProvider ?? "openai-compatible"), vscode6.ConfigurationTarget.Global),
-      config2.update("llm.baseUrl", String(payload.llmBaseUrl ?? ""), vscode6.ConfigurationTarget.Global),
-      config2.update("llm.model", String(payload.llmModel ?? ""), vscode6.ConfigurationTarget.Global),
+      config2.update("llm.provider", String(payload.llmProvider ?? "openai-compatible"), vscode7.ConfigurationTarget.Global),
+      config2.update("llm.baseUrl", String(payload.llmBaseUrl ?? ""), vscode7.ConfigurationTarget.Global),
+      config2.update("llm.model", String(payload.llmModel ?? ""), vscode7.ConfigurationTarget.Global),
       config2.update(
         "llm.temperature",
         Number(payload.llmTemperature ?? 0.1),
-        vscode6.ConfigurationTarget.Global
+        vscode7.ConfigurationTarget.Global
       ),
-      config2.update("oem.baseUrl", String(payload.oemBaseUrl ?? ""), vscode6.ConfigurationTarget.Global),
-      config2.update("oem.username", String(payload.oemUsername ?? ""), vscode6.ConfigurationTarget.Global)
+      config2.update("oem.baseUrl", String(payload.oemBaseUrl ?? ""), vscode7.ConfigurationTarget.Global),
+      config2.update("oem.username", String(payload.oemUsername ?? ""), vscode7.ConfigurationTarget.Global)
     ]);
     const llmApiKey = String(payload.llmApiKey ?? "").trim();
     if (llmApiKey) {
@@ -20916,8 +21363,12 @@ var SettingsPanel = class _SettingsPanel {
     if (oemPassword) {
       await secrets.setOemPassword(oemPassword);
     }
+    const tavilyApiKey = String(payload.tavilyApiKey ?? "").trim();
+    if (tavilyApiKey) {
+      await secrets.setTavilyApiKey(tavilyApiKey);
+    }
     await this.refresh(settingsService, secrets);
-    vscode6.window.showInformationMessage("OEM Assistant settings saved.");
+    vscode7.window.showInformationMessage("OEM Assistant settings saved.");
   }
   renderHtml() {
     return `<!DOCTYPE html>
@@ -21126,6 +21577,16 @@ var SettingsPanel = class _SettingsPanel {
     </div>
 
     <div class="card">
+      <div class="section-title">RAG\uFF08Oracle \u6587\u6863 / \u535A\u5BA2\uFF09</div>
+      <p class="subtitle" style="margin: 0 0 10px 0;">\u68C0\u7D22\u4EC5\u5141\u8BB8 <strong>docs.oracle.com/en/</strong> \u4E0E <strong>blogs.oracle.com</strong>\uFF08Tavily <code>include_domains</code> + URL \u4E8C\u6B21\u8FC7\u6EE4\uFF09\u3002</p>
+      <div class="grid">
+        <label class="field full">Tavily API Key\uFF08\u7559\u7A7A\u8868\u793A\u4E0D\u4FEE\u6539\uFF09
+          <input id="tavilyApiKey" type="password" placeholder="tvly-..." />
+        </label>
+      </div>
+    </div>
+
+    <div class="card">
       <div class="section-title">Security</div>
       <div class="grid">
         <label class="field full">MCP Bearer Token\uFF08\u7559\u7A7A\u8868\u793A\u4E0D\u4FEE\u6539\uFF09
@@ -21144,7 +21605,7 @@ var SettingsPanel = class _SettingsPanel {
 
     const fields = [
       'mcpServerUrl', 'mcpConnectionMode', 'llmProvider', 'llmBaseUrl', 'llmModel', 'llmTemperature',
-      'llmApiKey', 'oemBaseUrl', 'oemUsername', 'oemPassword', 'mcpBearerToken'
+      'llmApiKey', 'oemBaseUrl', 'oemUsername', 'oemPassword', 'tavilyApiKey', 'mcpBearerToken'
     ];
 
     document.getElementById('saveBtn').addEventListener('click', () => {
@@ -21173,12 +21634,14 @@ var SettingsPanel = class _SettingsPanel {
 
       document.getElementById('llmApiKey').value = '';
       document.getElementById('oemPassword').value = '';
+      document.getElementById('tavilyApiKey').value = '';
       document.getElementById('mcpBearerToken').value = '';
 
       const hints = [];
       if (state.hasLlmApiKey) hints.push('LLM Key\u5DF2\u4FDD\u5B58');
       if (state.hasMcpToken) hints.push('MCP Token\u5DF2\u4FDD\u5B58');
       if (state.hasOemPassword) hints.push('OEM\u5BC6\u7801\u5DF2\u4FDD\u5B58');
+      if (state.hasTavilyApiKey) hints.push('Tavily Key\u5DF2\u4FDD\u5B58');
       document.getElementById('secretHint').textContent = hints.join(' | ');
     });
   </script>
@@ -21197,29 +21660,40 @@ function trimSessionContext(turns) {
   }
 }
 function activate(context) {
-  const output = vscode7.window.createOutputChannel("OEM Assistant");
+  const output = vscode8.window.createOutputChannel("OEM Assistant");
   const settingsService = new SettingsService();
   const secrets = new SecretStorageService(context);
   const mcpService = new McpClientService(output, secrets);
   const sidebar = new OpsSidebarProvider(mcpService, settingsService);
-  const treeView = vscode7.window.createTreeView("alertMcp.sidebar", {
+  const treeView = vscode8.window.createTreeView("alertMcp.sidebar", {
     treeDataProvider: sidebar
   });
   const conversationStore = new ConversationStore(context);
   conversationStore.ensureAtLeastOneConversation();
+  const ragConversationStore = new ConversationStore(context, RAG_CONVERSATIONS_STORAGE_KEY);
+  ragConversationStore.ensureAtLeastOneConversation();
   const sessionContextMap = /* @__PURE__ */ new Map();
   const oemSessionIdByConvId = /* @__PURE__ */ new Map();
+  const ragSessionContextMap = /* @__PURE__ */ new Map();
   const syncSessionContextFromStore = (convId) => {
     const msgs = conversationStore.getMessagesForConversation(convId);
     sessionContextMap.set(convId, messagesToChatTurns(msgs));
   };
+  const syncRagSessionContextFromStore = (convId) => {
+    const msgs = ragConversationStore.getMessagesForConversation(convId);
+    ragSessionContextMap.set(convId, messagesToChatTurns(msgs));
+  };
   syncSessionContextFromStore(conversationStore.getActiveId());
+  syncRagSessionContextFromStore(ragConversationStore.getActiveId());
   context.subscriptions.push(output, treeView);
   let panel;
   let panelMessageDisposable;
+  let ragPanel;
+  let ragPanelMessageDisposable;
   context.subscriptions.push(
-    new vscode7.Disposable(() => {
+    new vscode8.Disposable(() => {
       panelMessageDisposable?.dispose();
+      ragPanelMessageDisposable?.dispose();
     })
   );
   const pushSessionTurn = (convId, turn) => {
@@ -21236,13 +21710,36 @@ function activate(context) {
     }
     return ctx;
   };
+  const pushRagSessionTurn = (convId, turn) => {
+    const arr = ragSessionContextMap.get(convId) ?? [];
+    arr.push(turn);
+    trimSessionContext(arr);
+    ragSessionContextMap.set(convId, arr);
+  };
+  const getRagContextForAsk = (convId) => {
+    let ctx = ragSessionContextMap.get(convId);
+    if (!ctx) {
+      ctx = messagesToChatTurns(ragConversationStore.getMessagesForConversation(convId));
+      ragSessionContextMap.set(convId, ctx);
+    }
+    return ctx;
+  };
   const refreshPanelTitle = (p) => {
     const id = conversationStore.getActiveId();
     const c = conversationStore.getConversation(id);
     p.setPanelTitle(c?.meta.title ?? "");
   };
+  const refreshRagPanelTitle = (p) => {
+    const id = ragConversationStore.getActiveId();
+    const c = ragConversationStore.getConversation(id);
+    p.setPanelTitle(c?.meta.title ?? "");
+  };
   const pushConversationListUpdate = (p) => {
     const boot = conversationStore.getBootstrapPayload();
+    p.postConversationListUpdate(boot.items, boot.activeId);
+  };
+  const pushRagConversationListUpdate = (p) => {
+    const boot = ragConversationStore.getBootstrapPayload();
     p.postConversationListUpdate(boot.items, boot.activeId);
   };
   const syncPanelToolCatalog = () => {
@@ -21258,9 +21755,9 @@ function activate(context) {
   };
   const connectMcp = async () => {
     const settings = settingsService.get();
-    await vscode7.window.withProgress(
+    await vscode8.window.withProgress(
       {
-        location: vscode7.ProgressLocation.Notification,
+        location: vscode8.ProgressLocation.Notification,
         title: "Connecting MCP server..."
       },
       async () => {
@@ -21271,7 +21768,7 @@ function activate(context) {
     syncPanelToolCatalog();
     const p = openPanel();
     p.postInfo(`MCP connected: ${mcpService.getConnectedUrl() ?? settings.mcp.serverUrl}`);
-    vscode7.window.showInformationMessage("MCP server connected.");
+    vscode8.window.showInformationMessage("MCP server connected.");
   };
   const runAsk = async (userQuestion, preferredTools, parsedPayload) => {
     const currentPanel = openPanel();
@@ -21280,9 +21777,9 @@ function activate(context) {
     const settings = settingsService.get();
     const orchestrator = new AssistantOrchestrator(settings, secrets, mcpService, output);
     try {
-      const result = await vscode7.window.withProgress(
+      const result = await vscode8.window.withProgress(
         {
-          location: vscode7.ProgressLocation.Notification,
+          location: vscode8.ProgressLocation.Notification,
           title: "Running alert assistant..."
         },
         async () => orchestrator.ask(userQuestion, ctx, {
@@ -21311,12 +21808,41 @@ function activate(context) {
       conversationStore.appendInfoMessage(askConvId, message);
       pushSessionTurn(askConvId, { role: "user", content: userQuestion });
       currentPanel.postInfo(message);
-      vscode7.window.showErrorMessage(message);
+      vscode8.window.showErrorMessage(message);
+    }
+  };
+  const runRagAsk = async (userQuestion) => {
+    const currentPanel = openRagPanel();
+    const askConvId = ragConversationStore.getActiveId();
+    const ctx = getRagContextForAsk(askConvId);
+    const settings = settingsService.get();
+    const orchestrator = new RagOrchestrator(settings, secrets, output);
+    try {
+      const result = await vscode8.window.withProgress(
+        {
+          location: vscode8.ProgressLocation.Notification,
+          title: "Running Oracle docs RAG..."
+        },
+        async () => orchestrator.ask(userQuestion, ctx)
+      );
+      ragConversationStore.appendUserMessage(askConvId, userQuestion, []);
+      ragConversationStore.appendAssistantMessage(askConvId, result);
+      pushRagSessionTurn(askConvId, { role: "user", content: userQuestion });
+      pushRagSessionTurn(askConvId, { role: "assistant", content: result.finalText });
+      currentPanel.postAssistantResult(askConvId, userQuestion, result, false);
+    } catch (error2) {
+      const message = error2 instanceof Error ? error2.message : String(error2);
+      output.appendLine(`[RAG ERROR] ${message}`);
+      ragConversationStore.appendUserMessage(askConvId, userQuestion, []);
+      ragConversationStore.appendInfoMessage(askConvId, message);
+      pushRagSessionTurn(askConvId, { role: "user", content: userQuestion });
+      currentPanel.postInfo(message);
+      vscode8.window.showErrorMessage(message);
     }
   };
   const askAssistant = async (payload) => {
     const parsedPayload = typeof payload === "string" ? { question: payload } : payload;
-    const userQuestion = parsedPayload?.question ?? await vscode7.window.showInputBox({
+    const userQuestion = parsedPayload?.question ?? await vscode8.window.showInputBox({
       prompt: "Ask the alert assistant",
       placeHolder: "\u4F8B\u5982\uFF1A@fetch_data_from_oem \u67E5\u8BE2\u6700\u8FD12\u5C0F\u65F6\u6240\u6709P1\u544A\u8B66\uFF0C\u5E76\u7ED9\u51FA\u5904\u7F6E\u5EFA\u8BAE"
     });
@@ -21364,7 +21890,7 @@ function activate(context) {
         let titleToApply = directTitle;
         if (!titleToApply) {
           const existing = conversationStore.getConversation(convId);
-          const next = await vscode7.window.showInputBox({
+          const next = await vscode8.window.showInputBox({
             prompt: "\u4F1A\u8BDD\u540D\u79F0",
             value: existing?.meta.title ?? ""
           });
@@ -21382,7 +21908,7 @@ function activate(context) {
       }
       if (message.type === "conversation/delete" && typeof message.id === "string") {
         const convId = message.id;
-        const confirmDelete = await vscode7.window.showWarningMessage(
+        const confirmDelete = await vscode8.window.showWarningMessage(
           "\u786E\u5B9A\u5220\u9664\u6B64\u4F1A\u8BDD\uFF1F",
           { modal: true },
           "\u5220\u9664"
@@ -21414,43 +21940,122 @@ function activate(context) {
     syncPanelToolCatalog();
     return panel;
   };
+  const openRagPanel = () => {
+    ragPanel = RagChatPanel.createOrShow(context);
+    ragPanelMessageDisposable?.dispose();
+    ragPanelMessageDisposable = ragPanel.onDidReceiveMessage(async (message) => {
+      if (message.type === "webview-ready") {
+        ragPanel.postBootstrap(ragConversationStore.getBootstrapPayload());
+        refreshRagPanelTitle(ragPanel);
+        return;
+      }
+      if (message.type === "conversation/create") {
+        const snap = ragConversationStore.createConversation();
+        ragSessionContextMap.set(snap.meta.id, []);
+        pushRagConversationListUpdate(ragPanel);
+        ragPanel.postConversationActivate(snap.meta.id, []);
+        refreshRagPanelTitle(ragPanel);
+        return;
+      }
+      if (message.type === "conversation/select" && typeof message.id === "string") {
+        ragConversationStore.setActive(message.id);
+        syncRagSessionContextFromStore(message.id);
+        const msgs = ragConversationStore.getMessagesForConversation(message.id);
+        ragPanel.postConversationActivate(message.id, msgs);
+        refreshRagPanelTitle(ragPanel);
+        return;
+      }
+      if (message.type === "conversation/rename" && typeof message.id === "string") {
+        const convId = message.id;
+        const directTitle = typeof message.title === "string" ? message.title.trim() : "";
+        let titleToApply = directTitle;
+        if (!titleToApply) {
+          const existing = ragConversationStore.getConversation(convId);
+          const next = await vscode8.window.showInputBox({
+            prompt: "\u4F1A\u8BDD\u540D\u79F0",
+            value: existing?.meta.title ?? ""
+          });
+          if (next === void 0) {
+            return;
+          }
+          titleToApply = next;
+        }
+        ragConversationStore.renameConversation(convId, titleToApply);
+        pushRagConversationListUpdate(ragPanel);
+        if (convId === ragConversationStore.getActiveId()) {
+          refreshRagPanelTitle(ragPanel);
+        }
+        return;
+      }
+      if (message.type === "conversation/delete" && typeof message.id === "string") {
+        const convId = message.id;
+        const confirmDelete = await vscode8.window.showWarningMessage(
+          "\u786E\u5B9A\u5220\u9664\u6B64\u4F1A\u8BDD\uFF1F",
+          { modal: true },
+          "\u5220\u9664"
+        );
+        if (confirmDelete !== "\u5220\u9664") {
+          return;
+        }
+        ragConversationStore.deleteConversation(convId);
+        ragSessionContextMap.delete(convId);
+        const boot = ragConversationStore.getBootstrapPayload();
+        pushRagConversationListUpdate(ragPanel);
+        ragPanel.postConversationActivate(boot.activeId, boot.activeMessages);
+        syncRagSessionContextFromStore(boot.activeId);
+        refreshRagPanelTitle(ragPanel);
+        return;
+      }
+      if (message.type === "rag-ask") {
+        const p = message.payload;
+        if (!p?.question?.trim()) {
+          return;
+        }
+        await runRagAsk(p.question.trim());
+      }
+    });
+    return ragPanel;
+  };
   context.subscriptions.push(
-    vscode7.commands.registerCommand("alertMcp.openConsole", () => {
+    vscode8.commands.registerCommand("alertMcp.openConsole", () => {
       openPanel();
     }),
-    vscode7.commands.registerCommand("alertMcp.connectMcp", connectMcp),
-    vscode7.commands.registerCommand("alertMcp.disconnectMcp", async () => {
+    vscode8.commands.registerCommand("alertMcp.openRagConsole", () => {
+      openRagPanel();
+    }),
+    vscode8.commands.registerCommand("alertMcp.connectMcp", connectMcp),
+    vscode8.commands.registerCommand("alertMcp.disconnectMcp", async () => {
       await mcpService.disconnect();
       oemSessionIdByConvId.clear();
       sidebar.refresh();
       syncPanelToolCatalog();
-      vscode7.window.showInformationMessage("MCP server disconnected.");
+      vscode8.window.showInformationMessage("MCP server disconnected.");
     }),
-    vscode7.commands.registerCommand("alertMcp.askAssistant", askAssistant),
-    vscode7.commands.registerCommand("alertMcp.showToolDescription", async (toolName, toolDescription) => {
+    vscode8.commands.registerCommand("alertMcp.askAssistant", askAssistant),
+    vscode8.commands.registerCommand("alertMcp.showToolDescription", async (toolName, toolDescription) => {
       const safeDescription = toolDescription || "No description from MCP server.";
-      vscode7.window.showInformationMessage(`${toolName}: ${safeDescription}`);
+      vscode8.window.showInformationMessage(`${toolName}: ${safeDescription}`);
       const currentPanel = openPanel();
       currentPanel.postInfo(`Tool: ${toolName}
 ${safeDescription}`);
     }),
-    vscode7.commands.registerCommand("alertMcp.openSettings", async () => {
+    vscode8.commands.registerCommand("alertMcp.openSettings", async () => {
       await SettingsPanel.createOrShow(context, settingsService, secrets);
     }),
-    vscode7.commands.registerCommand("alertMcp.setLlmApiKey", async () => {
+    vscode8.commands.registerCommand("alertMcp.setLlmApiKey", async () => {
       await promptAndStoreLlmApiKey(secrets);
     }),
-    vscode7.commands.registerCommand("alertMcp.setMcpBearerToken", async () => {
+    vscode8.commands.registerCommand("alertMcp.setMcpBearerToken", async () => {
       await promptAndStoreMcpToken(secrets);
     }),
-    vscode7.commands.registerCommand("alertMcp.refreshSidebar", async () => {
+    vscode8.commands.registerCommand("alertMcp.refreshSidebar", async () => {
       if (mcpService.isConnected()) {
         await mcpService.refreshTools();
       }
       sidebar.refresh();
       syncPanelToolCatalog();
     }),
-    vscode7.workspace.onDidChangeConfiguration((event) => {
+    vscode8.workspace.onDidChangeConfiguration((event) => {
       if (event.affectsConfiguration("alertMcp")) {
         sidebar.refresh();
         if (panel) {

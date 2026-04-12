@@ -17,7 +17,8 @@
     "onCommand:alertMcp.connectMcp",
     "onCommand:alertMcp.askAssistant",
     "onView:alertMcp.sidebar",
-    "onCommand:alertMcp.openSettings"
+    "onCommand:alertMcp.openSettings",
+    "onCommand:alertMcp.openRagConsole"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -25,6 +26,10 @@
       {
         "command": "alertMcp.openConsole",
         "title": "OEM Assistant: Open Console"
+      },
+      {
+        "command": "alertMcp.openRagConsole",
+        "title": "OEM Assistant: Open Console RAG"
       },
       {
         "command": "alertMcp.connectMcp",
@@ -81,6 +86,11 @@
         },
         {
           "command": "alertMcp.openConsole",
+          "when": "view == alertMcp.sidebar",
+          "group": "navigation"
+        },
+        {
+          "command": "alertMcp.openRagConsole",
           "when": "view == alertMcp.sidebar",
           "group": "navigation"
         },
@@ -162,6 +172,26 @@
           "type": "string",
           "default": "",
           "description": "OEM platform account username. Password is stored securely via SecretStorage."
+        },
+        "alertMcp.rag.searchTopK": {
+          "type": "number",
+          "default": 8,
+          "minimum": 1,
+          "maximum": 20,
+          "description": "Max Tavily search results per query (Tavily allows up to 20)."
+        },
+        "alertMcp.rag.snippetMaxChars": {
+          "type": "number",
+          "default": 6000,
+          "minimum": 500,
+          "description": "Total character budget for fetched page text passed to the LLM."
+        },
+        "alertMcp.rag.fetchSnippetPages": {
+          "type": "number",
+          "default": 3,
+          "minimum": 0,
+          "maximum": 5,
+          "description": "How many top search results to fetch as HTML snippets (0 = links only, no page fetch)."
         }
       }
     }

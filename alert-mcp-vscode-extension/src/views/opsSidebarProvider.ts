@@ -88,6 +88,13 @@ export class OpsSidebarProvider implements vscode.TreeDataProvider<SidebarItem> 
           title: 'Open Console'
         }
       }),
+      new SidebarItem('Open Console RAG', {
+        description: 'Oracle docs (docs.oracle.com) + LLM',
+        command: {
+          command: 'alertMcp.openRagConsole',
+          title: 'Open Console RAG'
+        }
+      }),
       new SidebarItem('Open Settings', {
         description: 'LLM / OEM / MCP credentials',
         command: {

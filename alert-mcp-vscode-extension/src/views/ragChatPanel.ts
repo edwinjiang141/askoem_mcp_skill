@@ -7,29 +7,19 @@ import type {
 } from '../types/appTypes';
 import { buildChatPanelHtml } from './chatPanelHtml';
 
-interface AskPayload {
-  question: string;
-  preferredTools: string[];
-}
-
-interface ToolMeta {
-  name: string;
-  description: string;
-}
-
-export class ChatPanel {
-  private static current: ChatPanel | undefined;
+export class RagChatPanel {
+  private static current: RagChatPanel | undefined;
   private readonly panel: vscode.WebviewPanel;
 
-  static createOrShow(context: vscode.ExtensionContext): ChatPanel {
-    if (ChatPanel.current) {
-      ChatPanel.current.panel.reveal(vscode.ViewColumn.One);
-      return ChatPanel.current;
+  static createOrShow(context: vscode.ExtensionContext): RagChatPanel {
+    if (RagChatPanel.current) {
+      RagChatPanel.current.panel.reveal(vscode.ViewColumn.One);
+      return RagChatPanel.current;
     }
 
     const panel = vscode.window.createWebviewPanel(
-      'alertMcpConsole',
-      'OEM Assistant Console',
+      'alertMcpRagConsole',
+      'OEM RAG Console',
       vscode.ViewColumn.One,
       {
         enableScripts: true,
@@ -38,18 +28,15 @@ export class ChatPanel {
       }
     );
 
-    ChatPanel.current = new ChatPanel(panel, context);
-    return ChatPanel.current;
+    RagChatPanel.current = new RagChatPanel(panel, context);
+    return RagChatPanel.current;
   }
 
   private constructor(panel: vscode.WebviewPanel, context: vscode.ExtensionContext) {
     this.panel = panel;
     this.panel.onDidDispose(() => {
-      ChatPanel.current = undefined;
+      RagChatPanel.current = undefined;
     });
-    const chartSrc = this.panel.webview
-      .asWebviewUri(vscode.Uri.joinPath(context.extensionUri, 'media', 'chart.umd.min.js'))
-      .toString();
     const csp = [
       `default-src 'none'`,
       `style-src ${this.panel.webview.cspSource} 'unsafe-inline'`,
@@ -57,16 +44,17 @@ export class ChatPanel {
       `img-src ${this.panel.webview.cspSource} data:`,
       `font-src ${this.panel.webview.cspSource} data:`
     ].join('; ');
-    this.panel.webview.html = this.renderHtml(chartSrc, csp);
+    this.panel.webview.html = this.renderHtml(csp);
   }
 
-  onDidReceiveMessage(handler: (message: any) => void): vscode.Disposable {
+  onDidReceiveMessage(handler: (message: Record<string, unknown>) => void): vscode.Disposable {
     return this.panel.webview.onDidReceiveMessage(handler);
   }
 
   setPanelTitle(title: string): void {
     const t = title.trim();
-    this.panel.title = t.length > 0 ? `OEM: ${t.length > 40 ? `${t.slice(0, 37)}...` : t}` : 'OEM Assistant Console';
+    this.panel.title =
+      t.length > 0 ? `OEM RAG: ${t.length > 40 ? `${t.slice(0, 37)}...` : t}` : 'OEM RAG Console';
   }
 
   postBootstrap(payload: ConversationsBootstrapPayload): void {
@@ -91,27 +79,19 @@ export class ChatPanel {
     conversationId: string,
     question: string,
     result: AssistantResult,
-    showFetchDataCharts: boolean
+    _showFetchDataCharts: boolean
   ): void {
     this.panel.webview.postMessage({
       type: 'assistant-result',
-      payload: { conversationId, question, result, showFetchDataCharts }
+      payload: { conversationId, question, result, showFetchDataCharts: false }
     });
-  }
-
-  postChartSettings(showFetchDataCharts: boolean): void {
-    this.panel.webview.postMessage({ type: 'chart-settings', payload: showFetchDataCharts });
   }
 
   postInfo(text: string): void {
     this.panel.webview.postMessage({ type: 'info', payload: text });
   }
 
-  postToolCatalog(tools: ToolMeta[]): void {
-    this.panel.webview.postMessage({ type: 'tools-catalog', payload: tools });
-  }
-
-  private renderHtml(chartSrc: string, csp: string): string {
-    return buildChatPanelHtml({ mode: 'oem', chartSrc, csp });
+  private renderHtml(csp: string): string {
+    return buildChatPanelHtml({ mode: 'rag', chartSrc: '', csp });
   }
 }

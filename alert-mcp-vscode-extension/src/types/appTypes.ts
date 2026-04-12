@@ -22,11 +22,26 @@ export interface ExtensionSettings {
     baseUrl: string;
     username: string;
   };
+  /** RAG console: Tavily search scoped to docs.oracle.com/en + blogs.oracle.com (API key in SecretStorage). */
+  rag: {
+    searchTopK: number;
+    snippetMaxChars: number;
+    fetchSnippetPages: number;
+  };
+}
+
+export interface DocReferenceLink {
+  title: string;
+  url: string;
+  /** Tavily result snippet; optional. */
+  snippet?: string;
 }
 
 export interface AssistantResult {
   finalText: string;
   steps: ExecutionStep[];
+  /** RAG console: links from Tavily (docs.oracle.com/en + blogs.oracle.com only). */
+  referenceLinks?: DocReferenceLink[];
 }
 
 /** One chart block for Webview (Chart.js). */

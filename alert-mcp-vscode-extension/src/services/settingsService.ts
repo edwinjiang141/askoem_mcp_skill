@@ -23,6 +23,11 @@ export class SettingsService {
       oem: {
         baseUrl: config.get<string>('oem.baseUrl', ''),
         username: config.get<string>('oem.username', '')
+      },
+      rag: {
+        searchTopK: config.get<number>('rag.searchTopK', 8),
+        snippetMaxChars: config.get<number>('rag.snippetMaxChars', 6000),
+        fetchSnippetPages: config.get<number>('rag.fetchSnippetPages', 3)
       }
     };
   }
