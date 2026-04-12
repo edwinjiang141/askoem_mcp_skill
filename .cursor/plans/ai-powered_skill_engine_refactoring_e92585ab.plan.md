@@ -109,6 +109,8 @@ flowchart TD
     T2 --> D2[返回原始结构化JSON]
 ```
 
+
+
 - `fetch_data_from_oem`: 纯数据工具，签名/返回值不变
 - `run_skill`: 新增 AI 诊断入口，内部调用 fetch_data + AI Skill Engine
 - `ask_ops`: 删除
@@ -200,15 +202,18 @@ llm = ChatOpenAI(
 **文件**: [src/mcp_server.py](src/mcp_server.py)
 
 删除：
+
 - **删除** `ask_ops` 函数定义（第 35-70 行）
 - **删除** `DEFAULT_KB_PATH` 常量（仅被 `ask_ops` 使用）
 
 新增 `run_skill` MCP tool：
+
 - **入参**: `question`(必填), `session_id`(推荐), 或 `oem_base_url + username + password`
 - **内部流程**: 调用 `service.run_skill_with_llm(question, session_id, ...)`
 - **返回**: `{ ok, session_id, skill_name, result }` —— result 为 LLM 生成的结构化诊断文本
 
 更新：
+
 - `health_check` 的 tools 列表改为 `["health_check", "oem_login", "fetch_data_from_oem", "run_skill"]`
 - `oem_login`、`fetch_data_from_oem`、`health_check` 三个工具的签名和行为不做任何改动
 

@@ -32,7 +32,8 @@ export class ChatPanel {
       vscode.ViewColumn.One,
       {
         enableScripts: true,
-        retainContextWhenHidden: true
+        retainContextWhenHidden: true,
+        localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'media')]
       }
     );
 
@@ -40,12 +41,22 @@ export class ChatPanel {
     return ChatPanel.current;
   }
 
-  private constructor(panel: vscode.WebviewPanel, _context: vscode.ExtensionContext) {
+  private constructor(panel: vscode.WebviewPanel, context: vscode.ExtensionContext) {
     this.panel = panel;
     this.panel.onDidDispose(() => {
       ChatPanel.current = undefined;
     });
-    this.panel.webview.html = this.renderHtml();
+    const chartSrc = this.panel.webview
+      .asWebviewUri(vscode.Uri.joinPath(context.extensionUri, 'media', 'chart.umd.min.js'))
+      .toString();
+    const csp = [
+      `default-src 'none'`,
+      `style-src ${this.panel.webview.cspSource} 'unsafe-inline'`,
+      `script-src ${this.panel.webview.cspSource} 'unsafe-inline'`,
+      `img-src ${this.panel.webview.cspSource} data:`,
+      `font-src ${this.panel.webview.cspSource} data:`
+    ].join('; ');
+    this.panel.webview.html = this.renderHtml(chartSrc, csp);
   }
 
   onDidReceiveMessage(handler: (message: any) => void): vscode.Disposable {
@@ -75,11 +86,20 @@ export class ChatPanel {
     });
   }
 
-  postAssistantResult(conversationId: string, question: string, result: AssistantResult): void {
+  postAssistantResult(
+    conversationId: string,
+    question: string,
+    result: AssistantResult,
+    showFetchDataCharts: boolean
+  ): void {
     this.panel.webview.postMessage({
       type: 'assistant-result',
-      payload: { conversationId, question, result }
+      payload: { conversationId, question, result, showFetchDataCharts }
     });
+  }
+
+  postChartSettings(showFetchDataCharts: boolean): void {
+    this.panel.webview.postMessage({ type: 'chart-settings', payload: showFetchDataCharts });
   }
 
   postInfo(text: string): void {
@@ -90,12 +110,13 @@ export class ChatPanel {
     this.panel.webview.postMessage({ type: 'tools-catalog', payload: tools });
   }
 
-  private renderHtml(): string {
+  private renderHtml(chartSrc: string, csp: string): string {
     return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy" content="${csp.replace(/"/g, '&quot;')}" />
   <title>OEM Assistant Console</title>
   <style>
     * { box-sizing: border-box; }
@@ -191,7 +212,7 @@ export class ChatPanel {
       display: flex;
       flex-direction: column;
       min-width: 0;
-      padding: 12px;
+      padding: 8px 4px;
     }
     .chat-log {
       display: flex;
@@ -206,16 +227,19 @@ export class ChatPanel {
       border: 1px solid var(--vscode-panel-border);
       border-radius: 10px;
       padding: 10px;
-      max-width: 92%;
       white-space: pre-wrap;
       word-break: break-word;
+      min-width: 0;
     }
     .bubble.user {
       align-self: flex-end;
+      max-width: min(92%, 720px);
       background: color-mix(in srgb, var(--vscode-button-background) 15%, transparent);
     }
     .bubble.assistant {
-      align-self: flex-start;
+      align-self: stretch;
+      width: 100%;
+      max-width: 100%;
       background: color-mix(in srgb, var(--vscode-editorWidget-background) 75%, transparent);
     }
     .bubble.info {
@@ -344,6 +368,54 @@ export class ChatPanel {
       min-height: 20px;
       margin: 4px 0;
     }
+    .oem-fetch-charts {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px 16px;
+      margin-top: 10px;
+      width: 100%;
+      align-items: start;
+    }
+    .chart-wrap {
+      position: relative;
+      width: 100%;
+      min-height: 300px;
+      height: clamp(320px, 44vh, 560px);
+      max-height: min(60vh, 640px);
+      min-width: 0;
+      margin-bottom: 0;
+    }
+    .chart-toolbar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 6px 0 10px 0;
+      border-bottom: 1px solid var(--vscode-panel-border);
+      font-size: 12px;
+      flex-wrap: wrap;
+    }
+    .chart-toolbar .chart-toggle-label {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+      user-select: none;
+    }
+    .chart-toolbar .chart-hint {
+      opacity: 0.75;
+      font-size: 11px;
+    }
+    .oem-chart-section {
+      margin-top: 12px;
+      padding-top: 10px;
+      border-top: 1px dashed var(--vscode-panel-border);
+    }
+    .oem-chart-section-title {
+      font-size: 12px;
+      font-weight: 600;
+      margin-bottom: 8px;
+      opacity: 0.9;
+    }
   </style>
 </head>
 <body>
@@ -355,6 +427,13 @@ export class ChatPanel {
       <ul id="convList" class="conv-list" role="list"></ul>
     </aside>
     <div class="conv-main">
+      <div class="chart-toolbar">
+        <label class="chart-toggle-label" for="chartToggle">
+          <input type="checkbox" id="chartToggle" checked />
+          显示数据图表
+        </label>
+        <span class="chart-hint">图表展示在助手回答正文下方；关闭后仅隐藏图表。</span>
+      </div>
       <div id="log" class="chat-log"></div>
       <div class="mention-wrap" id="mentions"></div>
       <div class="composer">
@@ -366,6 +445,7 @@ export class ChatPanel {
     </div>
   </div>
 
+  <script src="${chartSrc}"></script>
   <script>
     const vscode = acquireVsCodeApi();
     const input = document.getElementById('input');
@@ -374,11 +454,33 @@ export class ChatPanel {
     const mentions = document.getElementById('mentions');
     const convList = document.getElementById('convList');
     const newConvBtn = document.getElementById('newConvBtn');
+    const chartToggle = document.getElementById('chartToggle');
     let toolsCatalog = [];
     let currentOptions = [];
     let activeOptionIndex = 0;
     let currentActiveId = '';
     let convItems = [];
+    let showFetchDataCharts = true;
+    let settingsAllowCharts = true;
+
+    (function initChartToggleFromStorage() {
+      if (!chartToggle) {
+        return;
+      }
+      const saved = localStorage.getItem('oemAssistant.showCharts');
+      if (saved !== null) {
+        chartToggle.checked = saved === 'true';
+      }
+    })();
+
+    if (chartToggle) {
+      chartToggle.addEventListener('change', function() {
+        localStorage.setItem('oemAssistant.showCharts', String(chartToggle.checked));
+        document.querySelectorAll('.oem-chart-section').forEach(function(el) {
+          el.style.display = chartToggle.checked && settingsAllowCharts ? '' : 'none';
+        });
+      });
+    }
 
     function redrawMentions() {
       const used = extractToolMentions(input.value);
@@ -391,6 +493,9 @@ export class ChatPanel {
 
     function redactSensitiveText(raw) {
       let text = String(raw || '');
+      text = text.replace(/"password"\\s*:\\s*"[^"]*"/gi, '"password": "***"');
+      text = text.replace(/"pass"\\s*:\\s*"[^"]*"/gi, '"pass": "***"');
+      text = text.replace(/"pwd"\\s*:\\s*"[^"]*"/gi, '"pwd": "***"');
       text = text.replace(/(password\\s*[=:]\\s*)([^\\s,\\n]+)/gi, '$1***');
       text = text.replace(/(密码\\s*[：:\\=]\\s*)([^\\s,\\n]+)/g, '$1***');
       text = text.replace(/(username\\s*[=:]\\s*)([^\\s,\\n]+)/gi, '$1***');
@@ -425,18 +530,186 @@ export class ChatPanel {
       }).join('');
     }
 
-    function renderAssistantBubble(result, skipTypewriter) {
+    function buildChartJsOptions(chart) {
+      const tickFont = { font: { size: 11 } };
+      const scales = {};
+      if (chart.chartType === 'bar') {
+        scales.x = {
+          title: chart.xAxisLabel ? { display: true, text: chart.xAxisLabel } : undefined,
+          ticks: { maxRotation: 50, minRotation: 0, autoSkip: false, ...tickFont }
+        };
+        if (chart.yAxisLabel) {
+          scales.y = {
+            title: { display: true, text: chart.yAxisLabel },
+            ticks: { maxTicksLimit: 8, ...tickFont }
+          };
+        }
+      } else {
+        if (chart.xAxisLabel) {
+          scales.x = { title: { display: true, text: chart.xAxisLabel }, ticks: { ...tickFont } };
+        }
+        if (chart.yAxisLabel) {
+          scales.y = {
+            title: { display: true, text: chart.yAxisLabel },
+            ticks: { maxTicksLimit: 8, ...tickFont }
+          };
+        }
+      }
+      const base = { responsive: true, maintainAspectRatio: false };
+      if (Object.keys(scales).length) {
+        base.scales = scales;
+      }
+      const ds = chart.datasets || [];
+      if (chart.chartType === 'line' && ds.length > 1) {
+        base.plugins = {
+          legend: { display: true, position: 'bottom' }
+        };
+      }
+      return base;
+    }
+
+    function initFetchCharts(container) {
+      if (typeof Chart === 'undefined') {
+        return;
+      }
+      container.querySelectorAll('.oem-fetch-charts').forEach(function(el) {
+        const raw = el.getAttribute('data-spec');
+        if (!raw) {
+          return;
+        }
+        try {
+          const spec = JSON.parse(decodeURIComponent(raw));
+          el.innerHTML = '';
+          spec.charts.forEach(function(chart) {
+            const wrap = document.createElement('div');
+            wrap.className = 'chart-wrap';
+            const canvas = document.createElement('canvas');
+            wrap.appendChild(canvas);
+            el.appendChild(wrap);
+            const ctx = canvas.getContext('2d');
+            if (!ctx) {
+              return;
+            }
+            if (chart.chartType === 'scatter' && chart.scatterPoints && chart.scatterPoints.length) {
+              var pts = chart.scatterPoints;
+              var mag = pts.map(function(p) { return Math.abs(p.x) + Math.abs(p.y); });
+              var maxMag = Math.max.apply(null, mag) || 1;
+              new Chart(ctx, {
+                type: 'bubble',
+                data: {
+                  datasets: [{
+                    label: chart.title,
+                    data: pts.map(function(p, i) {
+                      var t = mag[i] / maxMag;
+                      return { x: p.x, y: p.y, r: 5 + t * 12 };
+                    }),
+                    backgroundColor: 'rgba(54, 162, 235, 0.38)',
+                    borderColor: 'rgba(54, 162, 235, 0.92)',
+                    borderWidth: 1,
+                    hoverBackgroundColor: 'rgba(54, 162, 235, 0.55)',
+                    hoverBorderColor: 'rgba(255, 255, 255, 0.95)',
+                    hoverBorderWidth: 2
+                  }]
+                },
+                options: {
+                  responsive: true,
+                  maintainAspectRatio: false,
+                  scales: {
+                    x: {
+                      type: 'linear',
+                      title: chart.xAxisLabel ? { display: true, text: chart.xAxisLabel } : undefined,
+                      ticks: { font: { size: 11 } }
+                    },
+                    y: {
+                      title: chart.yAxisLabel ? { display: true, text: chart.yAxisLabel } : undefined,
+                      ticks: { maxTicksLimit: 8, font: { size: 11 } }
+                    }
+                  },
+                  plugins: {
+                    tooltip: {
+                      callbacks: {
+                        label: function(ctx) {
+                          var d = ctx.raw;
+                          return 'x: ' + d.x + ', y: ' + d.y;
+                        }
+                      }
+                    }
+                  }
+                }
+              });
+            } else {
+              const opts = buildChartJsOptions(chart);
+              new Chart(ctx, {
+                type: chart.chartType,
+                data: {
+                  labels: chart.labels,
+                  datasets: (chart.datasets || []).map(function(ds) {
+                    return { label: ds.label, data: ds.data };
+                  })
+                },
+                options: opts
+              });
+            }
+          });
+        } catch (e) {
+          console.error(e);
+        }
+      });
+    }
+
+    function collectAllFetchCharts(result) {
+      const out = [];
+      if (!result || !result.steps) {
+        return { charts: [] };
+      }
+      for (var i = 0; i < result.steps.length; i++) {
+        var step = result.steps[i];
+        if (step.fetchCharts && step.fetchCharts.charts && step.fetchCharts.charts.length) {
+          for (var j = 0; j < step.fetchCharts.charts.length; j++) {
+            out.push(step.fetchCharts.charts[j]);
+          }
+        }
+      }
+      return { charts: out.slice(0, 10) };
+    }
+
+    function renderAssistantBubble(result, skipTypewriter, messageShowCharts) {
+      const settingsOk = messageShowCharts !== undefined ? messageShowCharts : showFetchDataCharts;
+      const userWantsCharts = chartToggle ? chartToggle.checked : true;
+      const useCharts = userWantsCharts && settingsOk && settingsAllowCharts;
+
       const wrapper = appendBubble('assistant', 'Assistant', '<div class="answer-body"></div>');
       const answerBody = wrapper.querySelector('.answer-body');
       if (!answerBody) return;
 
+      const chartSection = document.createElement('div');
+      chartSection.className = 'oem-chart-section';
+      chartSection.style.display = 'none';
+      answerBody.after(chartSection);
+
       const runSteps = () => {
-        const stepsHtml = result.steps.map(step => {
-          return '<div class="step">'
-            + '<div class="step-title">' + escapeHtml(step.title) + '</div>'
-            + '<div>' + escapeHtml(redactSensitiveText(step.detail)) + '</div>'
-            + '</div>';
-        }).join('');
+        const merged = collectAllFetchCharts(result);
+        if (useCharts && merged.charts.length) {
+          chartSection.style.display = '';
+          chartSection.innerHTML =
+            '<div class="oem-chart-section-title">数据图表</div>'
+            + '<div class="oem-fetch-charts" data-spec="' + encodeURIComponent(JSON.stringify(merged)) + '"></div>';
+          initFetchCharts(chartSection);
+        } else {
+          chartSection.style.display = 'none';
+          chartSection.innerHTML = '';
+        }
+
+        const stepsHtml = result.steps
+          .map(function(step) {
+            return (
+              '<div class="step">'
+              + '<div class="step-title">' + escapeHtml(step.title) + '</div>'
+              + '<div>' + escapeHtml(redactSensitiveText(step.detail)) + '</div>'
+              + '</div>'
+            );
+          })
+          .join('');
         if (stepsHtml) {
           const details = document.createElement('details');
           details.innerHTML = '<summary>Tool Execution Trace</summary>' + stepsHtml;
@@ -473,7 +746,7 @@ export class ChatPanel {
         if (m.kind === 'user') {
           appendBubble('user', 'You', '<div>' + escapeHtml(redactSensitiveText(m.text)) + '</div>');
         } else if (m.kind === 'assistant') {
-          renderAssistantBubble(m.result, true);
+          renderAssistantBubble(m.result, true, undefined);
         } else if (m.kind === 'info') {
           appendBubble('info', 'Info', '<div>' + escapeHtml(redactSensitiveText(m.text)) + '</div>');
         }
@@ -582,26 +855,30 @@ export class ChatPanel {
     convList.addEventListener('click', e => {
       const del = e.target.closest('.conv-del');
       if (del) {
+        e.preventDefault();
+        e.stopPropagation();
         const id = del.getAttribute('data-id');
-        if (id && confirm('删除此会话？')) {
+        if (id) {
           vscode.postMessage({ type: 'conversation/delete', id });
         }
         return;
       }
       const ren = e.target.closest('.conv-rename');
       if (ren) {
+        e.preventDefault();
+        e.stopPropagation();
         const id = ren.getAttribute('data-id');
-        const item = convItems.find(x => x.id === id);
-        const next = prompt('会话名称', item ? item.title : '');
-        if (next !== null && id) {
-          vscode.postMessage({ type: 'conversation/rename', id, title: next });
+        if (id) {
+          vscode.postMessage({ type: 'conversation/rename', id });
         }
         return;
       }
       const row = e.target.closest('.conv-item');
       if (row && !e.target.closest('button')) {
         const id = row.getAttribute('data-id');
-        if (id) vscode.postMessage({ type: 'conversation/select', id });
+        if (id) {
+          vscode.postMessage({ type: 'conversation/select', id });
+        }
       }
     });
 
@@ -677,13 +954,27 @@ export class ChatPanel {
         appendBubble('info', 'Info', '<div>' + escapeHtml(redactSensitiveText(message.payload)) + '</div>');
         return;
       }
+      if (message.type === 'chart-settings') {
+        showFetchDataCharts = Boolean(message.payload);
+        settingsAllowCharts = Boolean(message.payload);
+        if (chartToggle && localStorage.getItem('oemAssistant.showCharts') === null) {
+          chartToggle.checked = settingsAllowCharts;
+        }
+        if (chartToggle) {
+          document.querySelectorAll('.oem-chart-section').forEach(function(el) {
+            el.style.display = chartToggle.checked && settingsAllowCharts ? '' : 'none';
+          });
+        }
+        return;
+      }
       if (message.type === 'assistant-result') {
         const payload = message.payload;
         if (payload.conversationId && payload.conversationId !== currentActiveId) {
           return;
         }
         const result = payload.result;
-        renderAssistantBubble(result, false);
+        const msgCharts = payload.showFetchDataCharts;
+        renderAssistantBubble(result, false, msgCharts);
         return;
       }
     });

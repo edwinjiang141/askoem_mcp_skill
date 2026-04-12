@@ -66,7 +66,7 @@ def fetch_data_from_oem(
             "result": fetched.follow_up_question,
             "report": service.build_fetch_tool_report(fetched, question),
         }
-    return {
+    out: dict[str, Any] = {
         "ok": True,
         "session_id": fetched.session_id,
         "generated_sql": fetched.generated_sql,
@@ -92,6 +92,21 @@ def fetch_data_from_oem(
         },
         "report": service.build_fetch_tool_report(fetched, question),
     }
+    if fetched.omr_sub_queries:
+        out["multi_query"] = True
+        out["sub_results"] = [
+            {
+                "sub_question": s["sub_question"],
+                "generated_sql": s["generated_sql"],
+                "sql_source": s["sql_source"],
+                "data": {
+                    "latest_data": s["latest_data"],
+                    "metric_time_series": s.get("metric_time_series") or [],
+                },
+            }
+            for s in fetched.omr_sub_queries
+        ]
+    return out
 
 
 @mcp.tool()

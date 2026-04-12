@@ -15,6 +15,8 @@ export interface ExtensionSettings {
   };
   ui: {
     maxToolRounds: number;
+    /** When true, Webview renders charts for fetch_data_from_oem tool results (max 10 charts). */
+    showFetchDataCharts: boolean;
   };
   oem: {
     baseUrl: string;
@@ -27,10 +29,32 @@ export interface AssistantResult {
   steps: ExecutionStep[];
 }
 
+/** One chart block for Webview (Chart.js). */
+export interface FetchDataChartSpec {
+  title: string;
+  chartType: 'line' | 'bar' | 'scatter';
+  /** Category or time labels (line/bar). */
+  labels: string[];
+  /** Series values for line/bar. `null` marks gaps when multiple series share one label axis. */
+  datasets: Array<{ label: string; data: (number | null)[] }>;
+  /** Scatter: [{x,y}, ...] when chartType is scatter (labels may be empty). */
+  scatterPoints?: Array<{ x: number; y: number }>;
+  /** Chart.js X axis title (e.g. 指标 / 时间). */
+  xAxisLabel?: string;
+  /** Chart.js Y axis title (e.g. 数值 / VALUE). */
+  yAxisLabel?: string;
+}
+
+export interface FetchDataChartsPayload {
+  charts: FetchDataChartSpec[];
+}
+
 export interface ExecutionStep {
   type: 'thought' | 'tool-call' | 'tool-result' | 'info' | 'error';
   title: string;
   detail: string;
+  /** Present only for fetch_data_from_oem tool-result when data is chartable. */
+  fetchCharts?: FetchDataChartsPayload;
 }
 
 export interface ChatTurn {

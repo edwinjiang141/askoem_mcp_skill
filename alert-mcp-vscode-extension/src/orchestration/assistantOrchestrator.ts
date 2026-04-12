@@ -9,6 +9,12 @@ import type { ExtensionSettings } from '../types/appTypes';
 import { SecretStorageService } from '../services/secretStorageService';
 import { OpenAiCompatibleLlmService } from '../services/llm/openAiCompatibleLlmService';
 import { McpClientService } from '../services/mcp/mcpClientService';
+import { buildFetchDataChartsPayload } from '../charts/buildFetchDataChartsPayload';
+
+function extractQuestionForCharts(args: Record<string, unknown>): string {
+  const q = args.question ?? args.query ?? args.input ?? args.text;
+  return typeof q === 'string' ? q : '';
+}
 
 interface AskOptions {
   preferredTools?: string[];
@@ -154,7 +160,9 @@ export class AssistantOrchestrator {
           return { finalText: detail, steps };
         }
 
-        const reply = this.redactSensitiveText(llmReply.content ?? '(empty response)');
+        const reply = this.stripSqlExecutionTraceFromReportText(
+          this.redactSensitiveText(llmReply.content ?? '(empty response)')
+        );
         steps.push({
           type: 'info',
           title: 'Final answer',
@@ -190,13 +198,20 @@ export class AssistantOrchestrator {
         });
 
         const toolResult = await this.mcp.callTool(toolName, resolvedArgs);
-        const redactedToolResult = this.redactSensitiveText(toolResult);
+        const toolResultForLlm = this.prepareToolResultContentForLlm(toolResult);
         const toolResultDisplay = this.redactSensitiveText(this.formatToolResultForDisplay(toolResult));
-        steps.push({
+        const resultStep: ExecutionStep = {
           type: 'tool-result',
           title: `Tool result: ${toolName}`,
           detail: toolResultDisplay
-        });
+        };
+        if (toolName === 'fetch_data_from_oem') {
+          const fc = buildFetchDataChartsPayload(toolResult, extractQuestionForCharts(resolvedArgs));
+          if (fc?.charts?.length) {
+            resultStep.fetchCharts = fc;
+          }
+        }
+        steps.push(resultStep);
 
         if (toolName === 'ask_ops' && this.indicatesNoSop(toolResult)) {
           const noSopMessage = '未找到匹配的 SOP，已停止自动解答。请先补充/更新 SOP 后再重试。';
@@ -215,7 +230,7 @@ export class AssistantOrchestrator {
           role: 'tool',
           tool_call_id: toolCall.id,
           name: toolName,
-          content: redactedToolResult
+          content: toolResultForLlm
         });
       }
     }
@@ -329,11 +344,18 @@ export class AssistantOrchestrator {
       }
 
       const safeResult = this.redactSensitiveText(this.formatToolResultForDisplay(lastResult));
-      steps.push({
+      const chainResultStep: ExecutionStep = {
         type: 'tool-result',
         title: `Tool result: ${toolName}`,
         detail: safeResult
-      });
+      };
+      if (toolName === 'fetch_data_from_oem') {
+        const fc = buildFetchDataChartsPayload(lastResult, extractQuestionForCharts(args));
+        if (fc?.charts?.length) {
+          chainResultStep.fetchCharts = fc;
+        }
+      }
+      steps.push(chainResultStep);
 
       const sessionId = this.tryExtractSessionId(lastResult);
       if (sessionId) {
@@ -349,7 +371,9 @@ export class AssistantOrchestrator {
       }
     }
 
-    const chainFinal = this.formatToolResultForDisplay(lastResult || '').trim() || lastResult || '已按顺序完成所有 @ 工具调用。';
+    const rawChainFinal =
+      this.formatToolResultForDisplay(lastResult || '').trim() || lastResult || '已按顺序完成所有 @ 工具调用。';
+    const chainFinal = this.stripSqlExecutionTraceFromReportText(rawChainFinal);
     return {
       finalText: this.redactSensitiveText(chainFinal),
       steps
@@ -569,6 +593,41 @@ export class AssistantOrchestrator {
   }
 
   /**
+   * 从报告正文中移除「SQL 执行追踪」整段（保留至「状态」前），供 Assistant 回复与 LLM 上下文使用；
+   * Tool Execution Trace 仍使用 formatToolResultForDisplay 的完整 report。
+   */
+  private stripSqlExecutionTraceFromReportText(text: string): string {
+    const t = String(text ?? '');
+    if (!t.includes('【SQL 执行追踪】')) {
+      return t;
+    }
+    if (/\n【状态】/.test(t)) {
+      return t.replace(/\n?【SQL 执行追踪】[\s\S]*?(?=\n【状态】)/, '');
+    }
+    return t.replace(/\n?【SQL 执行追踪】[\s\S]*$/, '').trimEnd();
+  }
+
+  /**
+   * JSON 工具结果中去掉 report 里的 SQL 追踪段再交给 LLM，避免模型在最终回答中复述 SQL。
+   */
+  private prepareToolResultContentForLlm(raw: string): string {
+    const trimmed = raw.trim();
+    if (!trimmed.startsWith('{')) {
+      return this.redactSensitiveText(raw);
+    }
+    try {
+      const obj = JSON.parse(trimmed) as Record<string, unknown>;
+      if (typeof obj.report === 'string') {
+        const report = this.stripSqlExecutionTraceFromReportText(obj.report);
+        return this.redactSensitiveText(JSON.stringify({ ...obj, report }));
+      }
+    } catch {
+      // keep raw path below
+    }
+    return this.redactSensitiveText(raw);
+  }
+
+  /**
    * MCP 工具若返回 JSON 且含 report 字段，优先展示纯文本报告（含 SQL 执行追踪），避免整段 JSON 难读。
    */
   private formatToolResultForDisplay(raw: string): string {
@@ -588,7 +647,11 @@ export class AssistantOrchestrator {
   }
 
   private redactSensitiveText(input: string): string {
-    return input
+    let s = String(input ?? '');
+    s = s.replace(/"password"\s*:\s*"[^"]*"/gi, '"password": "***"');
+    s = s.replace(/"pass"\s*:\s*"[^"]*"/gi, '"pass": "***"');
+    s = s.replace(/"pwd"\s*:\s*"[^"]*"/gi, '"pwd": "***"');
+    return s
       .replace(/(password\s*[=:]\s*)([^\s,\n]+)/gi, '$1***')
       .replace(/(密码\s*[：:=]\s*)([^\s,\n]+)/g, '$1***')
       .replace(/(username\s*[=:]\s*)([^\s,\n]+)/gi, '$1***')

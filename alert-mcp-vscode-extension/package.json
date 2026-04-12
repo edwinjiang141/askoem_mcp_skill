@@ -148,6 +148,11 @@
           "maximum": 8,
           "description": "Maximum model-tool interaction rounds per user request."
         },
+        "alertMcp.ui.showFetchDataCharts": {
+          "type": "boolean",
+          "default": true,
+          "description": "When enabled, show Chart.js charts for fetch_data_from_oem tool results (up to 10 charts)."
+        },
         "alertMcp.oem.baseUrl": {
           "type": "string",
           "default": "",
@@ -162,7 +167,7 @@
     }
   },
   "scripts": {
-    "build": "node ./esbuild.mjs",
+    "build": "node ./esbuild.mjs && node ./scripts/copy-chart.mjs",
     "watch": "node ./esbuild.mjs --watch",
     "package": "npm run build && vsce package",
     "lint": "tsc --noEmit -p ./"
@@ -175,6 +180,7 @@
     "vsce": "latest"
   },
   "dependencies": {
-    "@modelcontextprotocol/client": "latest"
+    "@modelcontextprotocol/client": "latest",
+    "chart.js": "^4.4.8"
   }
 }

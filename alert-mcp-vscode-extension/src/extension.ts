@@ -153,7 +153,12 @@ export function activate(context: vscode.ExtensionContext): void {
         oemSessionIdByConvId.set(askConvId, sid);
       }
 
-      currentPanel.postAssistantResult(askConvId, userQuestion, result);
+      currentPanel.postAssistantResult(
+        askConvId,
+        userQuestion,
+        result,
+        settingsService.get().ui.showFetchDataCharts
+      );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       output.appendLine(`[ERROR] ${message}`);
@@ -191,6 +196,7 @@ export function activate(context: vscode.ExtensionContext): void {
     panelMessageDisposable = panel.onDidReceiveMessage(async (message: Record<string, unknown>) => {
       if (message.type === 'webview-ready') {
         panel!.postBootstrap(conversationStore.getBootstrapPayload());
+        panel!.postChartSettings(settingsService.get().ui.showFetchDataCharts);
         syncPanelToolCatalog();
         refreshPanelTitle(panel!);
         return;
@@ -216,22 +222,41 @@ export function activate(context: vscode.ExtensionContext): void {
         refreshPanelTitle(panel!);
         return;
       }
-      if (
-        message.type === 'conversation/rename' &&
-        typeof message.id === 'string' &&
-        typeof message.title === 'string'
-      ) {
-        conversationStore.renameConversation(message.id, message.title);
+      if (message.type === 'conversation/rename' && typeof message.id === 'string') {
+        const convId = message.id;
+        const directTitle = typeof message.title === 'string' ? message.title.trim() : '';
+        let titleToApply = directTitle;
+        if (!titleToApply) {
+          const existing = conversationStore.getConversation(convId);
+          const next = await vscode.window.showInputBox({
+            prompt: '会话名称',
+            value: existing?.meta.title ?? ''
+          });
+          if (next === undefined) {
+            return;
+          }
+          titleToApply = next;
+        }
+        conversationStore.renameConversation(convId, titleToApply);
         pushConversationListUpdate(panel!);
-        if (message.id === conversationStore.getActiveId()) {
+        if (convId === conversationStore.getActiveId()) {
           refreshPanelTitle(panel!);
         }
         return;
       }
       if (message.type === 'conversation/delete' && typeof message.id === 'string') {
-        conversationStore.deleteConversation(message.id);
-        sessionContextMap.delete(message.id);
-        oemSessionIdByConvId.delete(message.id);
+        const convId = message.id;
+        const confirmDelete = await vscode.window.showWarningMessage(
+          '确定删除此会话？',
+          { modal: true },
+          '删除'
+        );
+        if (confirmDelete !== '删除') {
+          return;
+        }
+        conversationStore.deleteConversation(convId);
+        sessionContextMap.delete(convId);
+        oemSessionIdByConvId.delete(convId);
         const boot = conversationStore.getBootstrapPayload();
         pushConversationListUpdate(panel!);
         panel!.postConversationActivate(boot.activeId, boot.activeMessages);
@@ -293,6 +318,9 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.workspace.onDidChangeConfiguration(event => {
       if (event.affectsConfiguration('alertMcp')) {
         sidebar.refresh();
+        if (panel) {
+          panel.postChartSettings(settingsService.get().ui.showFetchDataCharts);
+        }
       }
     }),
     {

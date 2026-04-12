@@ -16,6 +16,45 @@ from src.oem_client import OemClient, OemDataBundle
 from src.skill_engine import AgentSkillsEngine
 
 
+def _has_time_range_phrase(text: str) -> bool:
+    """输入：子问题文本。输出：是否含时间范围/趋势类表述（用于混合问题拆段）。"""
+    t = text.strip().lower()
+    if not t:
+        return False
+    patterns = (
+        r"过去\s*\d+\s*(天|周|小时|分钟|日)",
+        r"最近\s*\d+\s*(天|周|小时|分钟)",
+        r"(过去|最近)\s*一周",
+        r"(24|48|72)\s*小时",
+        r"\d+\s*(天|周|小时|分钟)\s*(内|以来)",
+        r"时间范围|时段|从\s*.+\s*到|between|last\s+\d+",
+        r"趋势|历史|时序|走势|随时间",
+        r"今日|昨日|本周|本月|上周",
+        r"\b(?:24h|7d|1w|30d)\b",
+        r"tr\s*\(\s*sysdate",
+    )
+    for p in patterns:
+        if re.search(p, t, re.IGNORECASE):
+            return True
+    return False
+
+
+def _split_mixed_omr_question(question: str) -> list[str] | None:
+    """
+    输入：整句问题。
+    输出：若同时存在「时间范围类」与「非时间范围类」子句（分号或换行分隔），返回子问题列表；否则 None，走单条 NL2SQL。
+    """
+    raw = question.strip()
+    parts = re.split(r"[；;]+|\n+", raw)
+    parts = [p.strip() for p in parts if p.strip()]
+    if len(parts) < 2:
+        return None
+    flags = [_has_time_range_phrase(p) for p in parts]
+    if not any(flags) or all(flags):
+        return None
+    return parts
+
+
 @dataclass
 class FetchDataResult:
     session_id: str | None
@@ -36,7 +75,8 @@ class FetchDataResult:
     events: list[dict[str, Any]]
     oem_errors: list[str] = None  # type: ignore[assignment]
     generated_sql: str | None = None
-    sql_source: str | None = None  # template | llm
+    sql_source: str | None = None  # template | llm | multi
+    omr_sub_queries: Optional[list[dict[str, Any]]] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         if self.oem_errors is None:
@@ -153,6 +193,7 @@ class AskOpsService:
                     "oem_errors": fetched.oem_errors,
                     "generated_sql": fetched.generated_sql,
                     "sql_source": fetched.sql_source,
+                    "omr_sub_queries": fetched.omr_sub_queries,
                 },
                 question,
             )
@@ -170,6 +211,7 @@ class AskOpsService:
                     "oem_errors": fetched.oem_errors,
                     "generated_sql": fetched.generated_sql,
                     "sql_source": fetched.sql_source,
+                    "omr_sub_queries": fetched.omr_sub_queries,
                 },
                 question,
             )
@@ -191,6 +233,7 @@ class AskOpsService:
                     "oem_errors": fetched.oem_errors,
                     "generated_sql": fetched.generated_sql,
                     "sql_source": fetched.sql_source,
+                    "omr_sub_queries": fetched.omr_sub_queries,
                 },
                 question,
             )
@@ -225,6 +268,7 @@ class AskOpsService:
                 "oem_errors": fetched.oem_errors,
                 "generated_sql": fetched.generated_sql,
                 "sql_source": fetched.sql_source,
+                "omr_sub_queries": fetched.omr_sub_queries,
             },
             question,
         )
@@ -245,7 +289,15 @@ class AskOpsService:
         lines.append("【SQL 执行追踪】")
         sql = result.get("generated_sql")
         src = result.get("sql_source")
-        if sql:
+        subs = result.get("omr_sub_queries")
+        if subs:
+            for i, sub in enumerate(subs, 1):
+                lines.append(f"--- 子查询 {i} ---")
+                lines.append(f"问题: {sub.get('sub_question', '')}")
+                lines.append(f"来源: {sub.get('sql_source', 'unknown')}")
+                lines.append("SQL:")
+                lines.append(str(sub.get("generated_sql", "")))
+        elif sql:
             lines.append(f"来源: {src or 'unknown'}")
             lines.append("SQL:")
             lines.append(str(sql))
@@ -281,7 +333,14 @@ class AskOpsService:
         lines.append(question.strip())
         lines.append("")
         lines.append("【SQL 执行追踪】")
-        if fetched.generated_sql:
+        if fetched.omr_sub_queries:
+            for i, sub in enumerate(fetched.omr_sub_queries, 1):
+                lines.append(f"--- 子查询 {i} ---")
+                lines.append(f"问题: {sub.get('sub_question', '')}")
+                lines.append(f"来源: {sub.get('sql_source', 'unknown')}")
+                lines.append("SQL:")
+                lines.append(str(sub.get("generated_sql", "")))
+        elif fetched.generated_sql:
             lines.append(f"来源: {fetched.sql_source or 'unknown'}")
             lines.append("SQL:")
             lines.append(fetched.generated_sql)
@@ -360,6 +419,20 @@ class AskOpsService:
     def _build_data_reply(self, fetched: FetchDataResult) -> str:
         """查询结果格式化：统一输出可读文本表格（不依赖 LLM）。"""
         rows = fetched.latest_data or []
+
+        if fetched.omr_sub_queries:
+            parts: list[str] = []
+            for i, sub in enumerate(fetched.omr_sub_queries, 1):
+                sq = str(sub.get("sub_question", ""))
+                sql = str(sub.get("generated_sql", ""))
+                src = str(sub.get("sql_source", ""))
+                sub_rows = sub.get("latest_data") or []
+                parts.append(
+                    f"--- 子查询 {i}: {sq} ---\n"
+                    f"来源: {src}\nSQL:\n{sql}\n"
+                    + self._build_sql_result_table_text(sub_rows)
+                )
+            return "\n\n".join(parts)
 
         # OMR NL2SQL 已执行：必须按 SQL 结果列展示，不能被 intent 误判成「目标清单」等模板覆盖
         if fetched.generated_sql:
@@ -763,6 +836,77 @@ class AskOpsService:
         # parse_intent 仅用于提取元数据（intent_type/target_name/time_range），不做 follow_up 门禁
         parsed = parse_intent(normalized_question, self._config.intent_metric_map)
 
+        parts = _split_mixed_omr_question(normalized_question)
+        if parts and len(parts) >= 2:
+            return self._fetch_data_from_omr_multi(parts, normalized_question, session_id, parsed)
+
+        return self._fetch_data_from_omr_single(normalized_question, session_id, parsed)
+
+    def _fetch_data_from_omr_multi(
+        self,
+        parts: list[str],
+        normalized_question: str,
+        session_id: Optional[str],
+        parsed: Any,
+    ) -> FetchDataResult:
+        """混合时间范围/快照子问题：逐段 NL2SQL；任一段失败则回退整句单条 SQL。"""
+        sub_results: list[dict[str, Any]] = []
+        for sq in parts:
+            plan = self._nl2sql.generate(sq)
+            if not plan:
+                return self._fetch_data_from_omr_single(normalized_question, session_id, parsed)
+            rows = self._omr_client.execute_sql(plan.sql)
+            sub_results.append({
+                "sub_question": sq,
+                "generated_sql": plan.sql,
+                "sql_source": plan.source,
+                "latest_data": rows,
+                "metric_time_series": [],
+            })
+        merged_latest: list[dict[str, Any]] = []
+        for i, sub in enumerate(sub_results):
+            for r in sub["latest_data"]:
+                rr = dict(r)
+                rr["_sub_query_index"] = i + 1
+                rr["_sub_question"] = sub["sub_question"]
+                merged_latest.append(rr)
+        scenario = None
+        if is_alert_related_question(normalized_question):
+            route = classify_alert_scenario(
+                question=normalized_question,
+                alert_scenarios=self._config.alert_scenarios,
+                llm=self._llm_classifier,
+            )
+            scenario = route.scenario
+        return FetchDataResult(
+            session_id=session_id,
+            need_follow_up=False,
+            follow_up_question=None,
+            intent_type=parsed.intent_type,
+            target_name=parsed.target_name,
+            target_type_name=parsed.target_type_name,
+            time_range=parsed.time_range,
+            metric_keys=parsed.metric_keys,
+            route_key=parsed.route_key,
+            scenario=scenario,
+            classifier="nl2sql_multi",
+            confidence=0.75,
+            latest_data=merged_latest,
+            metric_time_series=[],
+            incidents=[],
+            events=[],
+            oem_errors=[],
+            generated_sql=None,
+            sql_source="multi",
+            omr_sub_queries=sub_results,
+        )
+
+    def _fetch_data_from_omr_single(
+        self,
+        normalized_question: str,
+        session_id: Optional[str],
+        parsed: Any,
+    ) -> FetchDataResult:
         # NL2SQL 是 omr_db 模式的唯一决策者
         plan = self._nl2sql.generate(normalized_question)
         if not plan:

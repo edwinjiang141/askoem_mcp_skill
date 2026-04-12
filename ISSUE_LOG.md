@@ -15,6 +15,51 @@
 
 ---
 
+## 2026-04-11 — NL2SQL（`nl2sql_engine.py`）：表空间阈值/利用率、ORA-01722 与模板收紧
+
+- **范围**：`src/nl2sql_engine.py`、`tests/test_nl2sql_engine.py`
+
+- **问题 / 目标**：英文「database/RAC 表空间阈值 between 15 and 25」、中文「表空间利用率区间/大于 N percent/指定库名」等问法在 `fetch_data_from_oem` 执行时出现 **ORA-01722**；或模板过严导致无行；需模板 + few-shot + 安全检查与行为一致。
+
+- **结论（按修改项）：**
+  1. **根因说明**：`MGMT$METRIC_CURRENT.VALUE` 与 `MGMT$TARGET_METRIC_SETTINGS` 的 `WARNING_THRESHOLD` / `CRITICAL_THRESHOLD` 在 OMR 中多为 **VARCHAR**；对 `VALUE` 直接 `BETWEEN` / `>` 与数字字面量比较若触发隐式转换失败或非数字串会 **ORA-01722**；阈值配置与「当前采集利用率」应区分视图（阈值用 `MGMT$TARGET_METRIC_SETTINGS`，当前值用 `MGMT$METRIC_CURRENT`）。
+  2. **白名单与 schema**：`ALLOWED_VIEWS` 增加 `mgmt$target_metric_settings` / `sysman.mgmt$target_metric_settings`；`VIEW_SCHEMA_DESCRIPTION` 增加 **§8** `MGMT$TARGET_METRIC_SETTINGS` 列说明与 VARCHAR 阈值比较规则；**COLUMN_LABEL** 块顺延编号。
+  3. **英文阈值模板**：问题含 `tablespace`、`threshold`、`between X and Y` 且目标为 database/RAC 时，生成对 `sysman.mgmt$target_metric_settings` 的 SQL，`TO_NUMBER(TRIM(warning_threshold/critical_threshold))` + `REGEXP_LIKE` 数字串过滤。
+  4. **表空间利用率模板（区间）**：中文「高于/小于」、英文双界、`在…之间`、`between`（非 threshold 英文专指时）等；`SYSMAN.MGMT$METRIC_CURRENT` + 表空间相关 `metric_name`/`column_label`；**「列出…数据库」** 与「表空间+利用率」冲突时不再误返回 `MGMT$TARGET` 清单。
+  5. **单边阈值 + 库名 + percent**：解析「大于 N percent / % / 百分之 N」将阈值设为 **N/100**；无 percent 用语时用 **N**（0–100 口径）；`X数据库` 正则提取库名并 `LOWER(target_name)=LOWER('X')`；区间上 **between … percent**、中文 `%` 区间时对上下界除以 100。
+  6. **条件简化（用户反馈）**：去掉 `REGEXP_LIKE` 预过滤与冗长 `TO_NUMBER(REGEXP_REPLACE(...))` 链，改为 **`VALUE` 与数字字面量直接比较**（`value >= 0.15`、`value > 15 AND value < 30`、`value BETWEEN …`），`ORDER BY value DESC NULLS LAST`，依赖 Oracle 对 VARCHAR 的隐式数字比较以**避免过严过滤无数据**。
+  7. **`_has_unsafe_varchar_numeric_compare`**：仅对 **`warning_threshold` / `critical_threshold`** 要求 `TO_NUMBER(TRIM(...))`；**不再**将 `VALUE` 与数字字面量比较判为不安全（否则表空间模板无法通过 `_is_safe_sql`）。拒绝原因文案同步去掉对 `VALUE` 的强制描述。
+  8. **Few-shot 与系统规则**：补充英文阈值示例、中文区间与「omrdb + 15 percent」示例；规则 **12**（VALUE 比较策略）、**16**（表空间当前利用率、`percent` 与阈值口径）与 VIEW 中表空间段落与上述行为一致。
+  9. **测试**：`test_nl2sql_engine` 增加/调整表空间模板与安全检查用例；模板断言随 `value` 简化与阈值列分离而更新。
+
+- **备注**：若某库 `VALUE` 含 `%` 或非数字仍可能 **ORA-01722**，VIEW 中已说明可再改为 `TO_NUMBER(TRIM(REPLACE(VALUE,'%','')))`。修改 NL2SQL 后需**重启**加载该模块的 MCP/服务进程。
+
+---
+
+## 2026-04-11 — VS Code 扩展：fetch_data_from_oem 结果 Chart.js 图表
+
+- **范围**：`alert-mcp-vscode-extension/src/charts/buildFetchDataChartsPayload.ts`、`alert-mcp-vscode-extension/src/orchestration/assistantOrchestrator.ts`、`alert-mcp-vscode-extension/src/views/chatPanel.ts`、`alert-mcp-vscode-extension/src/extension.ts`、`alert-mcp-vscode-extension/src/types/appTypes.ts`、`alert-mcp-vscode-extension/src/services/settingsService.ts`、`alert-mcp-vscode-extension/package.json`、`alert-mcp-vscode-extension/scripts/copy-chart.mjs`、`alert-mcp-vscode-extension/media/chart.umd.min.js`
+
+- **问题 / 目标**：在仅改扩展的前提下，对 `fetch_data_from_oem` 工具返回的 JSON 中 `data.metric_time_series` / `data.latest_data` 做图表化，最多 10 个图；配置项 `alertMcp.ui.showFetchDataCharts` 控制是否渲染；不改变现有文本与 Trace 文本内容。
+
+- **结论**：
+  1. **`buildFetchDataChartsPayload`**：解析 MCP 原始 JSON（未改 Python），按时间序列分组折线、分类柱状、双数值散点；`fetchCharts` 挂在 `ExecutionStep` 上。
+  2. **`AssistantOrchestrator`**：主循环与 `@` 工具链两处 `tool-result` 在 `fetch_data_from_oem` 成功时附加 `fetchCharts`。
+  3. **Webview**：`localResourceRoots` + CSP；加载 `media/chart.umd.min.js`；图表渲染在助手 **`answer-body` 下方**「数据图表」区块（非 Trace 内）；Trace 为 `<details>` 纯文本；`chart-settings` / `assistant-result.showFetchDataCharts` 与主界面「显示数据图表」控制是否画图。
+  4. **`npm run build`** 后执行 `copy-chart.mjs`：优先从 `node_modules/chart.js` 复制，否则从 jsDelivr 拉取 UMD。
+
+- **备注**：Python MCP 未改动。关闭图表仅隐藏 canvas，报告文本不变。
+
+- **原「后续」计划项核对（2026-04-11）**：以下已在 `alert-mcp-vscode-extension/src/views/chatPanel.ts` 与 `buildFetchDataChartsPayload.ts` 落地，本条不再作为待办：
+  1. 图表区在助手气泡内 **`answer-body` 之后**、独立区块 **「数据图表」**（`.oem-chart-section` / `.oem-chart-section-title`）。
+  2. **Tool Execution Trace** 为 `<details>` 内纯文本步骤，**不含**图表 DOM。
+  3. 主界面 **「显示数据图表」** 复选框，`localStorage` 键 **`oemAssistant.showCharts`**。
+  4. **`FetchDataChartSpec`** 已含 **`xAxisLabel` / `yAxisLabel`**；柱状/折线等路径在 **`buildFetchDataChartsPayload`** 中通过 **`friendlyAxisName(catKey|timeKey|valKey)`** 填充轴标题。
+
+- **下一项开发建议**（未在本轮实现）：**`assistantOrchestrator.ts`** 仍含 **`ask_ops`** 文案；当前 **`shouldForceAskOps`** 在 MCP **未注册 `ask_ops`** 时返回 **false**，不会误拦。若产品要求「告警诊断必先调用 **`run_skill`** 或其它工具」，需改 system prompt / 强制逻辑与工具名，并记入本日志。
+
+---
+
 ## 2026-04-11 — VS Code 扩展：多会话控制台与 globalState 持久化
 
 - **范围**：`alert-mcp-vscode-extension/src/extension.ts`、`alert-mcp-vscode-extension/src/views/chatPanel.ts`、`alert-mcp-vscode-extension/src/services/conversationStore.ts`、`alert-mcp-vscode-extension/src/types/appTypes.ts`

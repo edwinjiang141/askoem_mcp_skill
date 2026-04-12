@@ -17,7 +17,8 @@ export class SettingsService {
         temperature: config.get<number>('llm.temperature', 0.1)
       },
       ui: {
-        maxToolRounds: config.get<number>('ui.maxToolRounds', 4)
+        maxToolRounds: config.get<number>('ui.maxToolRounds', 4),
+        showFetchDataCharts: config.get<boolean>('ui.showFetchDataCharts', true)
       },
       oem: {
         baseUrl: config.get<string>('oem.baseUrl', ''),
