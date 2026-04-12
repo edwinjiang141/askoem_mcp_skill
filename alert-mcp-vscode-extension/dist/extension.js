@@ -1293,10 +1293,65 @@ function labelForTime(v) {
   const s = String(v);
   return s.length > 32 ? s.slice(0, 29) + "\u2026" : s;
 }
-function applyChartTypePreference(chart, pref) {
-  if (!pref || chart.chartType === pref) {
+function formatChartTableNumber(n) {
+  if (!Number.isFinite(n)) {
+    return "";
+  }
+  if (Number.isInteger(n) && Math.abs(n) < 1e15) {
+    return String(n);
+  }
+  const a = Math.abs(n);
+  if (a >= 1e7 || a > 0 && a < 1e-4) {
+    return n.toExponential(4);
+  }
+  const s = n.toFixed(6);
+  return s.replace(/\.?0+$/, "");
+}
+function formatChartTableCell(v) {
+  if (v === null || v === void 0 || !Number.isFinite(Number(v))) {
+    return "";
+  }
+  return formatChartTableNumber(Number(v));
+}
+function lineOrBarChartToTable(chart) {
+  if (chart.chartType !== "line" && chart.chartType !== "bar") {
     return chart;
   }
+  const labels = chart.labels ?? [];
+  const datasets = chart.datasets ?? [];
+  if (labels.length === 0 || datasets.length === 0) {
+    return chart;
+  }
+  const xLabel = chart.xAxisLabel || "\u7C7B\u522B";
+  const cols = [xLabel, ...datasets.map((d) => String(d.label || chart.yAxisLabel || "\u503C"))];
+  const rows = labels.map((_, i) => {
+    const row = [String(labels[i] ?? "")];
+    for (const ds of datasets) {
+      row.push(formatChartTableCell(ds.data[i]));
+    }
+    return row;
+  });
+  return {
+    ...chart,
+    chartType: "table",
+    labels: [],
+    datasets: [],
+    tableColumns: cols,
+    tableRows: rows,
+    scatterPoints: void 0
+  };
+}
+function lineChartWithAtMostThreePointsToTable(chart) {
+  if (chart.chartType !== "line") {
+    return chart;
+  }
+  const n = chart.labels?.length ?? 0;
+  if (n === 0 || n > 3) {
+    return chart;
+  }
+  return lineOrBarChartToTable(chart);
+}
+function applyChartTypePreference(chart, pref) {
   if (chart.chartType === "scatter" && chart.scatterPoints?.length) {
     const pts = chart.scatterPoints;
     if (pref === "line" || pref === "bar") {
@@ -1308,19 +1363,63 @@ function applyChartTypePreference(chart, pref) {
         scatterPoints: void 0
       };
     }
+    const xLab = chart.xAxisLabel || "X";
+    const yLab = chart.yAxisLabel || "Y";
+    chart = {
+      ...chart,
+      chartType: "table",
+      labels: [],
+      datasets: [],
+      tableColumns: [xLab, yLab],
+      tableRows: pts.map((p) => [formatChartTableNumber(p.x), formatChartTableNumber(p.y)]),
+      scatterPoints: void 0,
+      xAxisLabel: chart.xAxisLabel,
+      yAxisLabel: chart.yAxisLabel
+    };
+  }
+  if (!pref || chart.chartType === pref) {
+    return chart;
+  }
+  if (chart.chartType === "table" && chart.tableRows?.length && chart.tableColumns?.length === 2) {
+    if (pref === "scatter") {
+      return chart;
+    }
+    if (pref === "line" || pref === "bar") {
+      const ys = chart.tableRows.map((r) => Number(r[1])).filter(Number.isFinite);
+      if (ys.length === chart.tableRows.length && ys.length > 0) {
+        return {
+          ...chart,
+          chartType: pref,
+          labels: chart.tableRows.map((_, i) => String(i + 1)),
+          datasets: [{ label: chart.title, data: ys }],
+          tableColumns: void 0,
+          tableRows: void 0,
+          scatterPoints: void 0
+        };
+      }
+    }
+    return chart;
   }
   if (pref === "scatter") {
     if (chart.chartType === "line" || chart.chartType === "bar") {
       const ds0 = chart.datasets[0];
       const labels = chart.labels;
       const vals = ds0?.data ?? [];
+      const xLabel = chart.xAxisLabel || "\u5E8F\u53F7";
+      const yLabel = String(ds0?.label ?? chart.yAxisLabel ?? "\u503C");
       return {
         ...chart,
-        chartType: "scatter",
-        scatterPoints: labels.map((_, i) => ({ x: i, y: vals[i] ?? 0 })),
+        chartType: "table",
         labels: [],
         datasets: [],
-        xAxisLabel: chart.xAxisLabel || "\u5E8F\u53F7",
+        tableColumns: [xLabel, yLabel],
+        tableRows: labels.map((l, i) => {
+          const v = vals[i];
+          const y = v === null || v === void 0 ? "" : formatChartTableNumber(Number(v));
+          return [String(l), y];
+        }),
+        scatterPoints: void 0,
+        xAxisLabel: chart.xAxisLabel,
         yAxisLabel: chart.yAxisLabel
       };
     }
@@ -1548,15 +1647,19 @@ function buildFetchDataChartsPayload(rawToolResult, userQuestion) {
             }
             return { x, y };
           }).filter((p) => p !== void 0);
-          if (pts.length > 1) {
+          const xLab = friendlyAxisName(k1);
+          const yLab = friendlyAxisName(k2);
+          const title = `${k1} vs ${k2}`;
+          if (pts.length >= 1) {
             charts.push({
-              title: `${k1} vs ${k2}`,
-              chartType: "scatter",
+              title,
+              chartType: "table",
               labels: [],
               datasets: [],
-              scatterPoints: pts,
-              xAxisLabel: friendlyAxisName(k1),
-              yAxisLabel: friendlyAxisName(k2)
+              tableColumns: [xLab, yLab],
+              tableRows: pts.map((p) => [formatChartTableNumber(p.x), formatChartTableNumber(p.y)]),
+              xAxisLabel: xLab,
+              yAxisLabel: yLab
             });
           }
         }
@@ -1576,6 +1679,7 @@ function finalizeCharts(charts, prefs, capCharts) {
   if (prefs.splitByMetric === false && out.filter((c) => c.chartType === "line").length > 1) {
     out = mergeLineChartSpecs(out);
   }
+  out = out.map((c) => lineChartWithAtMostThreePointsToTable(c));
   out = out.map((c) => applyChartTypePreference(c, prefs.chartType));
   return { charts: out.slice(0, capCharts) };
 }
@@ -20400,6 +20504,41 @@ function buildChatPanelHtml(options) {
       margin-bottom: 8px;
       opacity: 0.9;
     }
+    .oem-chart-block-title {
+      font-size: 12px;
+      font-weight: 600;
+      margin-bottom: 8px;
+      opacity: 0.95;
+      color: var(--vscode-foreground);
+    }
+    .chart-wrap-table {
+      min-height: auto;
+      height: auto;
+      max-height: none;
+    }
+    .oem-chart-table-wrap {
+      overflow-x: auto;
+      width: 100%;
+    }
+    .oem-chart-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    .oem-chart-table th,
+    .oem-chart-table td {
+      border: 1px solid var(--vscode-panel-border);
+      padding: 8px 10px;
+      text-align: left;
+      word-break: break-word;
+    }
+    .oem-chart-table th {
+      background: color-mix(in srgb, var(--vscode-editorWidget-background) 82%, transparent);
+      font-weight: 600;
+    }
+    .oem-chart-table tbody tr:nth-child(even) {
+      background: color-mix(in srgb, var(--vscode-editorWidget-background) 45%, transparent);
+    }
     .ref-links {
       margin-top: 12px;
       padding-top: 10px;
@@ -20599,6 +20738,45 @@ function buildChatPanelHtml(options) {
           spec.charts.forEach(function(chart) {
             const wrap = document.createElement('div');
             wrap.className = 'chart-wrap';
+
+            if (chart.chartType === 'table' && chart.tableRows && chart.tableRows.length && chart.tableColumns && chart.tableColumns.length >= 2) {
+              wrap.classList.add('chart-wrap-table');
+              if (chart.title) {
+                const bt = document.createElement('div');
+                bt.className = 'oem-chart-block-title';
+                bt.textContent = chart.title;
+                wrap.appendChild(bt);
+              }
+              const tw = document.createElement('div');
+              tw.className = 'oem-chart-table-wrap';
+              const tbl = document.createElement('table');
+              tbl.className = 'oem-chart-table';
+              const thead = document.createElement('thead');
+              const trh = document.createElement('tr');
+              chart.tableColumns.forEach(function(col) {
+                const th = document.createElement('th');
+                th.textContent = col;
+                trh.appendChild(th);
+              });
+              thead.appendChild(trh);
+              tbl.appendChild(thead);
+              const tbody = document.createElement('tbody');
+              chart.tableRows.forEach(function(row) {
+                const tr = document.createElement('tr');
+                row.forEach(function(cell) {
+                  const td = document.createElement('td');
+                  td.textContent = cell;
+                  tr.appendChild(td);
+                });
+                tbody.appendChild(tr);
+              });
+              tbl.appendChild(tbody);
+              tw.appendChild(tbl);
+              wrap.appendChild(tw);
+              el.appendChild(wrap);
+              return;
+            }
+
             const canvas = document.createElement('canvas');
             wrap.appendChild(canvas);
             el.appendChild(wrap);
@@ -20610,20 +20788,36 @@ function buildChatPanelHtml(options) {
               var pts = chart.scatterPoints;
               var mag = pts.map(function(p) { return Math.abs(p.x) + Math.abs(p.y); });
               var maxMag = Math.max.apply(null, mag) || 1;
+              if (chart.title) {
+                const bt2 = document.createElement('div');
+                bt2.className = 'oem-chart-block-title';
+                bt2.textContent = chart.title;
+                wrap.insertBefore(bt2, canvas);
+              }
+              var gridCol = 'rgba(128, 128, 128, 0.18)';
               new Chart(ctx, {
                 type: 'bubble',
                 data: {
                   datasets: [{
-                    label: chart.title,
+                    label: chart.title || 'series',
                     data: pts.map(function(p, i) {
                       var t = mag[i] / maxMag;
-                      return { x: p.x, y: p.y, r: 5 + t * 12 };
+                      var r = Math.max(14, Math.min(34, 10 + Math.sqrt(t) * 24));
+                      return { x: p.x, y: p.y, r: r };
                     }),
-                    backgroundColor: 'rgba(54, 162, 235, 0.38)',
-                    borderColor: 'rgba(54, 162, 235, 0.92)',
-                    borderWidth: 1,
-                    hoverBackgroundColor: 'rgba(54, 162, 235, 0.55)',
-                    hoverBorderColor: 'rgba(255, 255, 255, 0.95)',
+                    backgroundColor: pts.map(function(_, i) {
+                      var h = (200 + i * 47) % 360;
+                      return 'hsla(' + h + ', 58%, 52%, 0.58)';
+                    }),
+                    borderColor: pts.map(function(_, i) {
+                      var h = (200 + i * 47) % 360;
+                      return 'hsla(' + h + ', 58%, 38%, 0.92)';
+                    }),
+                    borderWidth: 2,
+                    hoverBackgroundColor: pts.map(function(_, i) {
+                      var h = (200 + i * 47) % 360;
+                      return 'hsla(' + h + ', 58%, 48%, 0.75)';
+                    }),
                     hoverBorderWidth: 2
                   }]
                 },
@@ -20634,19 +20828,22 @@ function buildChatPanelHtml(options) {
                     x: {
                       type: 'linear',
                       title: chart.xAxisLabel ? { display: true, text: chart.xAxisLabel } : undefined,
-                      ticks: { font: { size: 11 } }
+                      ticks: { font: { size: 11 } },
+                      grid: { color: gridCol }
                     },
                     y: {
                       title: chart.yAxisLabel ? { display: true, text: chart.yAxisLabel } : undefined,
-                      ticks: { maxTicksLimit: 8, font: { size: 11 } }
+                      ticks: { maxTicksLimit: 8, font: { size: 11 } },
+                      grid: { color: gridCol }
                     }
                   },
                   plugins: {
+                    legend: { display: false },
                     tooltip: {
                       callbacks: {
                         label: function(ctx) {
                           var d = ctx.raw;
-                          return 'x: ' + d.x + ', y: ' + d.y;
+                          return 'x: ' + d.x + ', y: ' + d.y + ' (r\u2248' + (d.r && d.r.toFixed ? d.r.toFixed(1) : d.r) + ')';
                         }
                       }
                     }

@@ -175,13 +175,13 @@ class AskOpsService:
         """
         # 步骤 1: 数据层取数（捕获认证异常，避免冒泡导致 Cline 误判为前置条件失败）
         try:
-            fetched = self.fetch_data(
-                question=question,
-                session_id=session_id,
-                oem_base_url=oem_base_url,
-                username=username,
-                password=password,
-            )
+        fetched = self.fetch_data(
+            question=question,
+            session_id=session_id,
+            oem_base_url=oem_base_url,
+            username=username,
+            password=password,
+        )
         except (ValueError, RuntimeError) as e:
             return self._finalize_run_skill_result(
                 {
@@ -968,16 +968,16 @@ class AskOpsService:
         oem_errors: list[str] = []
 
         try:
-            bundle = self._oem_client.fetch_bundle(
-                session=session,
-                endpoints=self._config.endpoints,
-                target_name=parsed.target_name,
-                route_config=self._merge_route_target_type(
-                    self._config.intent_metric_map.get(parsed.route_key or "", {}),
-                    parsed.target_type_name,
-                ),
-                time_range=parsed.time_range,
-            )
+        bundle = self._oem_client.fetch_bundle(
+            session=session,
+            endpoints=self._config.endpoints,
+            target_name=parsed.target_name,
+            route_config=self._merge_route_target_type(
+                self._config.intent_metric_map.get(parsed.route_key or "", {}),
+                parsed.target_type_name,
+            ),
+            time_range=parsed.time_range,
+        )
         except RuntimeError as e:
             oem_errors.append(str(e))
             bundle = OemDataBundle(
@@ -992,26 +992,26 @@ class AskOpsService:
         events = bundle.events
         if scenario:
             try:
-                incidents = self._oem_client.list_recent_incidents(
-                    session=session,
-                    endpoints=self._config.endpoints,
-                    target_name=parsed.target_name,
-                    target_type_name=parsed.target_type_name if parsed.target_name else None,
-                    scenario=scenario,
-                    question=question,
-                    age_hours=24,
-                    limit=50,
-                )
+            incidents = self._oem_client.list_recent_incidents(
+                session=session,
+                endpoints=self._config.endpoints,
+                target_name=parsed.target_name,
+                target_type_name=parsed.target_type_name if parsed.target_name else None,
+                scenario=scenario,
+                question=question,
+                age_hours=24,
+                limit=50,
+            )
             except RuntimeError as e:
                 oem_errors.append(str(e))
                 incidents = []
 
             try:
-                events = self._oem_client.list_events_by_incidents(
-                    session=session,
-                    endpoints=self._config.endpoints,
-                    incidents=incidents,
-                )
+            events = self._oem_client.list_events_by_incidents(
+                session=session,
+                endpoints=self._config.endpoints,
+                incidents=incidents,
+            )
             except RuntimeError as e:
                 oem_errors.append(str(e))
                 events = []
@@ -1087,11 +1087,11 @@ class AskOpsService:
                 merged_latest.append(rr)
         scenario = None
         if is_alert_related_question(normalized_question):
-            route = classify_alert_scenario(
+        route = classify_alert_scenario(
                 question=normalized_question,
-                alert_scenarios=self._config.alert_scenarios,
-                llm=self._llm_classifier,
-            )
+            alert_scenarios=self._config.alert_scenarios,
+            llm=self._llm_classifier,
+        )
             scenario = route.scenario
         return FetchDataResult(
             session_id=session_id,
@@ -1142,7 +1142,7 @@ class AskOpsService:
                     f"请尝试更具体的问题，例如：'列出所有主机'、'omrd 的当前指标值'、'当前未关闭的告警有哪些'。"
                 ),
                 intent_type=parsed.intent_type,
-                target_name=parsed.target_name,
+            target_name=parsed.target_name,
                 target_type_name=parsed.target_type_name,
                 time_range=parsed.time_range,
                 metric_keys=parsed.metric_keys,

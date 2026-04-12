@@ -47,13 +47,16 @@ export interface AssistantResult {
 /** One chart block for Webview (Chart.js). */
 export interface FetchDataChartSpec {
   title: string;
-  chartType: 'line' | 'bar' | 'scatter';
+  chartType: 'line' | 'bar' | 'scatter' | 'table';
   /** Category or time labels (line/bar). */
   labels: string[];
   /** Series values for line/bar. `null` marks gaps when multiple series share one label axis. */
   datasets: Array<{ label: string; data: (number | null)[] }>;
-  /** Scatter: [{x,y}, ...] when chartType is scatter (labels may be empty). */
+  /** Legacy: [{x,y}, ...]; payload layer normalizes to table before Webview. */
   scatterPoints?: Array<{ x: number; y: number }>;
+  /** Table: first column is category/time; more columns when multi-series. */
+  tableColumns?: string[];
+  tableRows?: string[][];
   /** Chart.js X axis title (e.g. 指标 / 时间). */
   xAxisLabel?: string;
   /** Chart.js Y axis title (e.g. 数值 / VALUE). */

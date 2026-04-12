@@ -15,6 +15,24 @@
 
 ---
 
+## 2026-04-11 — VS Code 扩展：fetch_data 图表 — 散点改表格、小样本折线改表格、类型标签、多列表格
+
+- **范围**：[`alert-mcp-vscode-extension/src/charts/buildFetchDataChartsPayload.ts`](e:\edwin\AIGC\askoem\alert-mcp-vscode-extension\src\charts\buildFetchDataChartsPayload.ts)、[`alert-mcp-vscode-extension/src/types/appTypes.ts`](e:\edwin\AIGC\askoem\alert-mcp-vscode-extension\src\types\appTypes.ts)、[`alert-mcp-vscode-extension/src/views/chatPanelHtml.ts`](e:\edwin\AIGC\askoem\alert-mcp-vscode-extension\src\views\chatPanelHtml.ts)
+
+- **问题 / 目标**：散点/气泡可读性差；折线在点数极少时折线意义不大；表格需支持多系列列；前端需标明当前块是何种图表类型。
+
+- **结论**：
+  1. **`latest_data` 两列数值**：不再下发 `chartType: 'scatter'`，一律 **`table`**（两列数值格式化写入 `tableColumns` / `tableRows`）。
+  2. **遗留 `scatter` + `scatterPoints`**：在 **`applyChartTypePreference`** 开头归一：用户未指定折线/柱状时改为 **`table`**；避免 `pref === scatter` 与 `chartType === scatter` 时早退导致不落表。
+  3. **用户问题含「散点图 / scatter」**（`parseChartPreferencesFromQuestion` → `chartType: scatter`）：原先把折线/柱状转成散点；现改为转成 **两列表格**（横轴标签 + 数值列），不再画气泡。
+  4. **折线图点数 ≤3**：在 **`finalizeCharts`** 中，于 **`mergeLineChartSpecs` 之后**、**`applyChartTypePreference` 之前**，对 **`chartType === 'line'`** 且 **`labels.length` 为 1～3** 的 spec 调用 **`lineOrBarChartToTable`**，与多系列折线一致（首列类别/时间，其余列为各 `dataset`）。
+  5. **`FetchDataChartSpec`**：**`tableColumns`** / **`tableRows`** 类型为 **`string[]`** / **`string[][]`**，支持多列表格；Webview 表格分支条件为 **`tableColumns.length >= 2`**。
+  6. **Webview**：每个图表块在标题上方增加 **`图表类型：…`**（折线图 / 柱状图 / 散点图（气泡）/ 表格），样式类 **`oem-chart-type-row`**、**`oem-chart-type-label`**。
+
+- **备注**：**柱状图**不按条数强制改表格；仅折线受「≤3 点」规则影响。修改扩展后**重新加载窗口/扩展**。
+
+---
+
 ## 2026-04-11 — 【汇总】扩展 RAG Console、Tavily 检索、fetch_data Trace 与 MCP 取数摘要（本轮）
 
 - **范围（VS Code 扩展）**：[`alert-mcp-vscode-extension/`](e:\edwin\AIGC\askoem\alert-mcp-vscode-extension) 内 `extension.ts`、`views/chatPanel.ts`、`chatPanelHtml.ts`、`chatPanelTypes.ts`、`ragChatPanel.ts`、`services/conversationStore.ts`、`oracleDocSearchService.ts`、`secretStorageService.ts`、`orchestration/ragOrchestrator.ts`、`orchestration/assistantOrchestrator.ts`、`views/opsSidebarProvider.ts`、`views/settingsPanel.ts`、`services/settingsService.ts`、`types/appTypes.ts`、`package.json`；脚本 [`scripts/gen_chat_panel_html.py`](e:\edwin\AIGC\askoem\alert-mcp-vscode-extension\scripts\gen_chat_panel_html.py)（可选，用于从 `chatPanel` 再生成 HTML 模板）。

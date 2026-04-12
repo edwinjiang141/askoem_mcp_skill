@@ -312,6 +312,41 @@ export function buildChatPanelHtml(options: {
       margin-bottom: 8px;
       opacity: 0.9;
     }
+    .oem-chart-block-title {
+      font-size: 12px;
+      font-weight: 600;
+      margin-bottom: 8px;
+      opacity: 0.95;
+      color: var(--vscode-foreground);
+    }
+    .chart-wrap-table {
+      min-height: auto;
+      height: auto;
+      max-height: none;
+    }
+    .oem-chart-table-wrap {
+      overflow-x: auto;
+      width: 100%;
+    }
+    .oem-chart-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    .oem-chart-table th,
+    .oem-chart-table td {
+      border: 1px solid var(--vscode-panel-border);
+      padding: 8px 10px;
+      text-align: left;
+      word-break: break-word;
+    }
+    .oem-chart-table th {
+      background: color-mix(in srgb, var(--vscode-editorWidget-background) 82%, transparent);
+      font-weight: 600;
+    }
+    .oem-chart-table tbody tr:nth-child(even) {
+      background: color-mix(in srgb, var(--vscode-editorWidget-background) 45%, transparent);
+    }
     .ref-links {
       margin-top: 12px;
       padding-top: 10px;
@@ -511,6 +546,45 @@ export function buildChatPanelHtml(options: {
           spec.charts.forEach(function(chart) {
             const wrap = document.createElement('div');
             wrap.className = 'chart-wrap';
+
+            if (chart.chartType === 'table' && chart.tableRows && chart.tableRows.length && chart.tableColumns && chart.tableColumns.length >= 2) {
+              wrap.classList.add('chart-wrap-table');
+              if (chart.title) {
+                const bt = document.createElement('div');
+                bt.className = 'oem-chart-block-title';
+                bt.textContent = chart.title;
+                wrap.appendChild(bt);
+              }
+              const tw = document.createElement('div');
+              tw.className = 'oem-chart-table-wrap';
+              const tbl = document.createElement('table');
+              tbl.className = 'oem-chart-table';
+              const thead = document.createElement('thead');
+              const trh = document.createElement('tr');
+              chart.tableColumns.forEach(function(col) {
+                const th = document.createElement('th');
+                th.textContent = col;
+                trh.appendChild(th);
+              });
+              thead.appendChild(trh);
+              tbl.appendChild(thead);
+              const tbody = document.createElement('tbody');
+              chart.tableRows.forEach(function(row) {
+                const tr = document.createElement('tr');
+                row.forEach(function(cell) {
+                  const td = document.createElement('td');
+                  td.textContent = cell;
+                  tr.appendChild(td);
+                });
+                tbody.appendChild(tr);
+              });
+              tbl.appendChild(tbody);
+              tw.appendChild(tbl);
+              wrap.appendChild(tw);
+              el.appendChild(wrap);
+              return;
+            }
+
             const canvas = document.createElement('canvas');
             wrap.appendChild(canvas);
             el.appendChild(wrap);
@@ -522,20 +596,36 @@ export function buildChatPanelHtml(options: {
               var pts = chart.scatterPoints;
               var mag = pts.map(function(p) { return Math.abs(p.x) + Math.abs(p.y); });
               var maxMag = Math.max.apply(null, mag) || 1;
+              if (chart.title) {
+                const bt2 = document.createElement('div');
+                bt2.className = 'oem-chart-block-title';
+                bt2.textContent = chart.title;
+                wrap.insertBefore(bt2, canvas);
+              }
+              var gridCol = 'rgba(128, 128, 128, 0.18)';
               new Chart(ctx, {
                 type: 'bubble',
                 data: {
                   datasets: [{
-                    label: chart.title,
+                    label: chart.title || 'series',
                     data: pts.map(function(p, i) {
                       var t = mag[i] / maxMag;
-                      return { x: p.x, y: p.y, r: 5 + t * 12 };
+                      var r = Math.max(14, Math.min(34, 10 + Math.sqrt(t) * 24));
+                      return { x: p.x, y: p.y, r: r };
                     }),
-                    backgroundColor: 'rgba(54, 162, 235, 0.38)',
-                    borderColor: 'rgba(54, 162, 235, 0.92)',
-                    borderWidth: 1,
-                    hoverBackgroundColor: 'rgba(54, 162, 235, 0.55)',
-                    hoverBorderColor: 'rgba(255, 255, 255, 0.95)',
+                    backgroundColor: pts.map(function(_, i) {
+                      var h = (200 + i * 47) % 360;
+                      return 'hsla(' + h + ', 58%, 52%, 0.58)';
+                    }),
+                    borderColor: pts.map(function(_, i) {
+                      var h = (200 + i * 47) % 360;
+                      return 'hsla(' + h + ', 58%, 38%, 0.92)';
+                    }),
+                    borderWidth: 2,
+                    hoverBackgroundColor: pts.map(function(_, i) {
+                      var h = (200 + i * 47) % 360;
+                      return 'hsla(' + h + ', 58%, 48%, 0.75)';
+                    }),
                     hoverBorderWidth: 2
                   }]
                 },
@@ -546,19 +636,22 @@ export function buildChatPanelHtml(options: {
                     x: {
                       type: 'linear',
                       title: chart.xAxisLabel ? { display: true, text: chart.xAxisLabel } : undefined,
-                      ticks: { font: { size: 11 } }
+                      ticks: { font: { size: 11 } },
+                      grid: { color: gridCol }
                     },
                     y: {
                       title: chart.yAxisLabel ? { display: true, text: chart.yAxisLabel } : undefined,
-                      ticks: { maxTicksLimit: 8, font: { size: 11 } }
+                      ticks: { maxTicksLimit: 8, font: { size: 11 } },
+                      grid: { color: gridCol }
                     }
                   },
                   plugins: {
+                    legend: { display: false },
                     tooltip: {
                       callbacks: {
                         label: function(ctx) {
                           var d = ctx.raw;
-                          return 'x: ' + d.x + ', y: ' + d.y;
+                          return 'x: ' + d.x + ', y: ' + d.y + ' (r≈' + (d.r && d.r.toFixed ? d.r.toFixed(1) : d.r) + ')';
                         }
                       }
                     }

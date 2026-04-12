@@ -728,14 +728,79 @@ function labelForTime(v: unknown): string {
   return s.length > 32 ? s.slice(0, 29) + '…' : s;
 }
 
+/** Table cells for two-numeric-column display (replaces scatter/bubble). */
+function formatChartTableNumber(n: number): string {
+  if (!Number.isFinite(n)) {
+    return '';
+  }
+  if (Number.isInteger(n) && Math.abs(n) < 1e15) {
+    return String(n);
+  }
+  const a = Math.abs(n);
+  if (a >= 1e7 || (a > 0 && a < 1e-4)) {
+    return n.toExponential(4);
+  }
+  const s = n.toFixed(6);
+  return s.replace(/\.?0+$/, '');
+}
+
+function formatChartTableCell(v: number | null | undefined): string {
+  if (v === null || v === undefined || !Number.isFinite(Number(v))) {
+    return '';
+  }
+  return formatChartTableNumber(Number(v));
+}
+
+/** 折线/柱状 → 表格（多系列为多列）。 */
+function lineOrBarChartToTable(chart: FetchDataChartSpec): FetchDataChartSpec {
+  if (chart.chartType !== 'line' && chart.chartType !== 'bar') {
+    return chart;
+  }
+  const labels = chart.labels ?? [];
+  const datasets = chart.datasets ?? [];
+  if (labels.length === 0 || datasets.length === 0) {
+    return chart;
+  }
+  const xLabel = chart.xAxisLabel || '类别';
+  const cols: string[] = [xLabel, ...datasets.map(d => String(d.label || chart.yAxisLabel || '值'))];
+  const rows: string[][] = labels.map((_, i) => {
+    const row: string[] = [String(labels[i] ?? '')];
+    for (const ds of datasets) {
+      row.push(formatChartTableCell(ds.data[i] as number | null | undefined));
+    }
+    return row;
+  });
+  return {
+    ...chart,
+    chartType: 'table',
+    labels: [],
+    datasets: [],
+    tableColumns: cols,
+    tableRows: rows,
+    scatterPoints: undefined
+  };
+}
+
+/** 折线图横轴点数 ≤3 时用表格更清晰。 */
+function lineChartWithAtMostThreePointsToTable(chart: FetchDataChartSpec): FetchDataChartSpec {
+  if (chart.chartType !== 'line') {
+    return chart;
+  }
+  const n = chart.labels?.length ?? 0;
+  if (n === 0 || n > 3) {
+    return chart;
+  }
+  return lineOrBarChartToTable(chart);
+}
+
 function applyChartTypePreference(
   chart: FetchDataChartSpec,
   pref?: 'line' | 'bar' | 'scatter'
 ): FetchDataChartSpec {
-  if (!pref || chart.chartType === pref) {
-    return chart;
-  }
-
+  /**
+   * Legacy scatter payloads: table unless user explicitly wants line/bar (must run before pref-match early return,
+   * otherwise pref===scatter and chartType===scatter would skip normalization).
+   */
   if (chart.chartType === 'scatter' && chart.scatterPoints?.length) {
     const pts = chart.scatterPoints;
     if (pref === 'line' || pref === 'bar') {
@@ -747,6 +812,45 @@ function applyChartTypePreference(
         scatterPoints: undefined
       };
     }
+    const xLab = chart.xAxisLabel || 'X';
+    const yLab = chart.yAxisLabel || 'Y';
+    chart = {
+      ...chart,
+      chartType: 'table',
+      labels: [],
+      datasets: [],
+      tableColumns: [xLab, yLab],
+      tableRows: pts.map(p => [formatChartTableNumber(p.x), formatChartTableNumber(p.y)]),
+      scatterPoints: undefined,
+      xAxisLabel: chart.xAxisLabel,
+      yAxisLabel: chart.yAxisLabel
+    };
+  }
+
+  if (!pref || chart.chartType === pref) {
+    return chart;
+  }
+
+  /** Two-column numeric table: scatter preference keeps table (no bubble). Line/bar pref converts to chart. */
+  if (chart.chartType === 'table' && chart.tableRows?.length && chart.tableColumns?.length === 2) {
+    if (pref === 'scatter') {
+      return chart;
+    }
+    if (pref === 'line' || pref === 'bar') {
+      const ys = chart.tableRows.map(r => Number(r[1])).filter(Number.isFinite);
+      if (ys.length === chart.tableRows.length && ys.length > 0) {
+        return {
+          ...chart,
+          chartType: pref,
+          labels: chart.tableRows.map((_, i) => String(i + 1)),
+          datasets: [{ label: chart.title, data: ys }],
+          tableColumns: undefined,
+          tableRows: undefined,
+          scatterPoints: undefined
+        };
+      }
+    }
+    return chart;
   }
 
   if (pref === 'scatter') {
@@ -754,13 +858,22 @@ function applyChartTypePreference(
       const ds0 = chart.datasets[0];
       const labels = chart.labels;
       const vals = ds0?.data ?? [];
+      const xLabel = chart.xAxisLabel || '序号';
+      const yLabel = String(ds0?.label ?? chart.yAxisLabel ?? '值');
       return {
         ...chart,
-        chartType: 'scatter',
-        scatterPoints: labels.map((_, i) => ({ x: i, y: vals[i] ?? 0 })),
+        chartType: 'table',
         labels: [],
         datasets: [],
-        xAxisLabel: chart.xAxisLabel || '序号',
+        tableColumns: [xLabel, yLabel],
+        tableRows: labels.map((l, i) => {
+          const v = vals[i];
+          const y =
+            v === null || v === undefined ? '' : formatChartTableNumber(Number(v));
+          return [String(l), y];
+        }),
+        scatterPoints: undefined,
+        xAxisLabel: chart.xAxisLabel,
         yAxisLabel: chart.yAxisLabel
       };
     }
@@ -1028,15 +1141,19 @@ export function buildFetchDataChartsPayload(
             return { x, y };
           })
           .filter((p): p is { x: number; y: number } => p !== undefined);
-        if (pts.length > 1) {
+        const xLab = friendlyAxisName(k1);
+        const yLab = friendlyAxisName(k2);
+        const title = `${k1} vs ${k2}`;
+        if (pts.length >= 1) {
           charts.push({
-            title: `${k1} vs ${k2}`,
-            chartType: 'scatter',
+            title,
+            chartType: 'table',
             labels: [],
             datasets: [],
-            scatterPoints: pts,
-            xAxisLabel: friendlyAxisName(k1),
-            yAxisLabel: friendlyAxisName(k2)
+            tableColumns: [xLab, yLab],
+            tableRows: pts.map(p => [formatChartTableNumber(p.x), formatChartTableNumber(p.y)]),
+            xAxisLabel: xLab,
+            yAxisLabel: yLab
           });
         }
       }
@@ -1062,6 +1179,7 @@ function finalizeCharts(
   if (prefs.splitByMetric === false && out.filter(c => c.chartType === 'line').length > 1) {
     out = mergeLineChartSpecs(out);
   }
+  out = out.map(c => lineChartWithAtMostThreePointsToTable(c));
   out = out.map(c => applyChartTypePreference(c, prefs.chartType));
   return { charts: out.slice(0, capCharts) };
 }
