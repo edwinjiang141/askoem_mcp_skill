@@ -226,7 +226,14 @@ class SkillExecutor:
 
         context_info = ""
         if context:
-            context_info = f"OEM 监控数据（作为诊断证据）：\n{json.dumps(context, ensure_ascii=False, indent=2)}"
+            prefix = ""
+            if context.get("health_tool_results"):
+                prefix = (
+                    "【脚本工具结论】health_tool_results 由预设工具脚本生成，"
+                    "已包含各块形态与跨块对照。最终四段正文必须仅依据 health_tool_results 与 oem_console_deep_link 撰写，"
+                    "不得从其它字段自行重算尖峰或跨块关系。\n\n"
+                )
+            context_info = prefix + f"OEM 监控数据（作为诊断证据）：\n{json.dumps(context, ensure_ascii=False, indent=2)}"
 
         # OEM 数据不足时加载 references 作为补充知识
         if skill.references and self._is_oem_data_insufficient(context):
@@ -247,6 +254,9 @@ class SkillExecutor:
         """OEM 取数存在错误，或 incidents/events/latestData/timeSeries 全部为空。"""
         if not context:
             return True
+        ht = context.get("health_tool_results")
+        if isinstance(ht, dict) and ht.get("sections") is not None:
+            return False
         if context.get("oem_errors"):
             return True
         data_fields = ("incidents", "events", "latest_data", "metric_time_series")
@@ -299,13 +309,19 @@ class AgentSkillsEngine:
             self.executor = None  # type: ignore[assignment]
             self.enabled = False
 
-    def process(self, user_input: str, context: Optional[dict] = None) -> Tuple[str, Optional[str]]:
+    def process(
+        self,
+        user_input: str,
+        context: Optional[dict] = None,
+        forced_skill_name: Optional[str] = None,
+    ) -> Tuple[str, Optional[str]]:
         """
         完整流程：路由 -> 执行 -> 返回结果。
 
         输入：
           - user_input: 用户自然语言问题
           - context: OEM 数据字典（incidents/events/metrics），作为 LLM 的诊断证据
+          - forced_skill_name: 若提供且在注册表中存在，跳过路由器直接使用该 Skill
 
         输出：
           - (诊断文本, 命中的 Skill 名称)
@@ -314,8 +330,14 @@ class AgentSkillsEngine:
         if not self.enabled:
             return "LLM 未配置（缺少 DEEPSEEK_API_KEY），无法执行 AI 诊断。", None
 
-        # 步骤 1: 路由
-        skill_name = self.router.route(user_input)
+        # 步骤 1: 路由（可强制指定 Skill，例如 OMR 健康检查模板取数命中）
+        skill_name: Optional[str] = None
+        if forced_skill_name:
+            fn = forced_skill_name.strip()
+            if fn in self.registry.skills:
+                skill_name = fn
+        if not skill_name:
+            skill_name = self.router.route(user_input)
         if not skill_name:
             return "未找到匹配的 Skill，无法生成 AI 诊断。", None
 

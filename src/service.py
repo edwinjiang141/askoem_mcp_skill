@@ -14,6 +14,15 @@ from src.metric_config import MetricConfig
 from src.nl2sql_engine import OemNl2SqlEngine
 from src.omr_client import OmrClient, OmrConfig
 from src.oem_client import OemClient, OemDataBundle
+from src.oracle_health_check import (
+    ORACLE_HEALTH_CHECK_SKILL_NAME,
+    execute_health_check_bundle,
+    extract_health_check_targets,
+    is_health_check_question,
+    parse_health_check_minutes,
+    wants_lock_metrics,
+)
+from src.oracle_health_tools import run_health_analysis_tools
 from src.skill_engine import AgentSkillsEngine
 
 
@@ -94,6 +103,7 @@ class FetchDataResult:
     generated_sql: str | None = None
     sql_source: str | None = None  # template | llm | multi
     omr_sub_queries: Optional[list[dict[str, Any]]] = None  # type: ignore[assignment]
+    forced_skill_name: str | None = None
 
     def __post_init__(self) -> None:
         if self.oem_errors is None:
@@ -160,6 +170,7 @@ class AskOpsService:
         oem_base_url: Optional[str] = None,
         username: Optional[str] = None,
         password: Optional[str] = None,
+        skill_name: Optional[str] = None,
     ) -> dict[str, Any]:
         """
         AI 诊断统一入口。
@@ -175,13 +186,13 @@ class AskOpsService:
         """
         # 步骤 1: 数据层取数（捕获认证异常，避免冒泡导致 Cline 误判为前置条件失败）
         try:
-        fetched = self.fetch_data(
-            question=question,
-            session_id=session_id,
-            oem_base_url=oem_base_url,
-            username=username,
-            password=password,
-        )
+            fetched = self.fetch_data(
+                question=question,
+                session_id=session_id,
+                oem_base_url=oem_base_url,
+                username=username,
+                password=password,
+            )
         except (ValueError, RuntimeError) as e:
             return self._finalize_run_skill_result(
                 {
@@ -196,6 +207,7 @@ class AskOpsService:
                     "sql_source": None,
                 },
                 question,
+                None,
             )
 
         if fetched.need_follow_up:
@@ -213,6 +225,7 @@ class AskOpsService:
                     "omr_sub_queries": fetched.omr_sub_queries,
                 },
                 question,
+                fetched,
             )
 
         # 非诊断类问题（如目标清单/监控项清单）直接返回结构化数据结果，避免无意义进入 Skill 路由。
@@ -231,6 +244,7 @@ class AskOpsService:
                     "omr_sub_queries": fetched.omr_sub_queries,
                 },
                 question,
+                fetched,
             )
 
         # omr_db 通用数据查询：有数据行且不是诊断类意图 → 直接格式化为文本表格返回
@@ -253,25 +267,53 @@ class AskOpsService:
                     "omr_sub_queries": fetched.omr_sub_queries,
                 },
                 question,
+                fetched,
             )
 
-        # 步骤 2: 组装 OEM 数据为 Skill Engine 的 context（截断避免 token 超限）
-        context = {
-            "target_name": fetched.target_name,
-            "scenario": fetched.scenario,
-            "time_range": fetched.time_range,
-            "incidents": fetched.incidents[:20],
-            "events": fetched.events[:20],
-            "latest_data": fetched.latest_data[:10],
-            "metric_time_series": fetched.metric_time_series[:10],
-            "oem_errors": fetched.oem_errors,
-        }
+        # 步骤 2: 组装 context。Oracle 快速健康检查：先跑脚本工具，LLM 只消费 health_tool_results，不注入原始行。
+        if (
+            fetched.forced_skill_name == ORACLE_HEALTH_CHECK_SKILL_NAME
+            and fetched.omr_sub_queries
+        ):
+            tool_payload = run_health_analysis_tools(
+                fetched.omr_sub_queries,
+                self._config.default_base_url,
+            )
+            context: dict[str, Any] = {
+                "target_name": fetched.target_name,
+                "scenario": fetched.scenario,
+                "time_range": fetched.time_range,
+                "health_tool_results": tool_payload,
+                "oem_console_deep_link": tool_payload.get("oem_console_entry_url", ""),
+                "oem_errors": fetched.oem_errors,
+                "latest_data": [],
+                "metric_time_series": [],
+                "incidents": [],
+                "events": [],
+            }
+        else:
+            max_ld = 80 if fetched.omr_sub_queries else 10
+            context = {
+                "target_name": fetched.target_name,
+                "scenario": fetched.scenario,
+                "time_range": fetched.time_range,
+                "incidents": fetched.incidents[:20],
+                "events": fetched.events[:20],
+                "latest_data": fetched.latest_data[:max_ld],
+                "metric_time_series": fetched.metric_time_series[:10],
+                "oem_errors": fetched.oem_errors,
+            }
 
         # 步骤 3: 调用 AI Skill Engine（SkillRouter 选 Skill -> SkillExecutor 生成诊断）
-        result_text, skill_name = self._skill_engine.process(question, context)
+        forced = ((skill_name or "").strip() or (fetched.forced_skill_name or "")).strip() or None
+        result_text, resolved_skill = self._skill_engine.process(
+            question,
+            context,
+            forced_skill_name=forced,
+        )
 
         # 步骤 4: 未命中 Skill 时降级
-        if skill_name is None:
+        if resolved_skill is None:
             result_text = self._build_fallback_summary(fetched)
 
         return self._finalize_run_skill_result(
@@ -280,7 +322,7 @@ class AskOpsService:
                 "session_id": fetched.session_id,
                 "need_follow_up": False,
                 "follow_up_question": None,
-                "skill_name": skill_name,
+                "skill_name": resolved_skill,
                 "result": result_text,
                 "oem_errors": fetched.oem_errors,
                 "generated_sql": fetched.generated_sql,
@@ -288,11 +330,58 @@ class AskOpsService:
                 "omr_sub_queries": fetched.omr_sub_queries,
             },
             question,
+            fetched,
         )
 
-    def _finalize_run_skill_result(self, out: dict[str, Any], question: str) -> dict[str, Any]:
+    def _run_skill_chart_payload(self, fetched: FetchDataResult) -> dict[str, Any]:
+        """与 fetch_data_from_oem 对齐的 data / multi_query 结构，供扩展图表构建。"""
+        payload: dict[str, Any] = {
+            "data": {
+                "latest_data": fetched.latest_data,
+                "metric_time_series": fetched.metric_time_series or [],
+                "incidents": fetched.incidents or [],
+                "events": fetched.events or [],
+            },
+            "intent": {
+                "intent_type": fetched.intent_type,
+                "target_name": fetched.target_name,
+                "target_type_name": fetched.target_type_name,
+                "time_range": fetched.time_range,
+                "metric_keys": fetched.metric_keys or [],
+                "route_key": fetched.route_key,
+            },
+            "routing": {
+                "scenario": fetched.scenario,
+                "classifier": fetched.classifier,
+                "confidence": fetched.confidence,
+            },
+        }
+        if fetched.omr_sub_queries:
+            payload["multi_query"] = True
+            payload["sub_results"] = [
+                {
+                    "sub_question": s["sub_question"],
+                    "generated_sql": s["generated_sql"],
+                    "sql_source": s["sql_source"],
+                    "data": {
+                        "latest_data": s["latest_data"],
+                        "metric_time_series": s.get("metric_time_series") or [],
+                    },
+                }
+                for s in fetched.omr_sub_queries
+            ]
+        return payload
+
+    def _finalize_run_skill_result(
+        self,
+        out: dict[str, Any],
+        question: str,
+        fetched: FetchDataResult | None,
+    ) -> dict[str, Any]:
         """为 MCP 工具追加固定版式的 report 字段（纯文本，便于 trace 阅读）。"""
         out["report"] = self.build_run_skill_tool_report(out, question)
+        if fetched is not None and out.get("ok") is True:
+            out.update(self._run_skill_chart_payload(fetched))
         return out
 
     def build_run_skill_tool_report(self, result: dict[str, Any], question: str) -> str:
@@ -968,16 +1057,16 @@ class AskOpsService:
         oem_errors: list[str] = []
 
         try:
-        bundle = self._oem_client.fetch_bundle(
-            session=session,
-            endpoints=self._config.endpoints,
-            target_name=parsed.target_name,
-            route_config=self._merge_route_target_type(
-                self._config.intent_metric_map.get(parsed.route_key or "", {}),
-                parsed.target_type_name,
-            ),
-            time_range=parsed.time_range,
-        )
+            bundle = self._oem_client.fetch_bundle(
+                session=session,
+                endpoints=self._config.endpoints,
+                target_name=parsed.target_name,
+                route_config=self._merge_route_target_type(
+                    self._config.intent_metric_map.get(parsed.route_key or "", {}),
+                    parsed.target_type_name,
+                ),
+                time_range=parsed.time_range,
+            )
         except RuntimeError as e:
             oem_errors.append(str(e))
             bundle = OemDataBundle(
@@ -992,26 +1081,26 @@ class AskOpsService:
         events = bundle.events
         if scenario:
             try:
-            incidents = self._oem_client.list_recent_incidents(
-                session=session,
-                endpoints=self._config.endpoints,
-                target_name=parsed.target_name,
-                target_type_name=parsed.target_type_name if parsed.target_name else None,
-                scenario=scenario,
-                question=question,
-                age_hours=24,
-                limit=50,
-            )
+                incidents = self._oem_client.list_recent_incidents(
+                    session=session,
+                    endpoints=self._config.endpoints,
+                    target_name=parsed.target_name,
+                    target_type_name=parsed.target_type_name if parsed.target_name else None,
+                    scenario=scenario,
+                    question=question,
+                    age_hours=24,
+                    limit=50,
+                )
             except RuntimeError as e:
                 oem_errors.append(str(e))
                 incidents = []
 
             try:
-            events = self._oem_client.list_events_by_incidents(
-                session=session,
-                endpoints=self._config.endpoints,
-                incidents=incidents,
-            )
+                events = self._oem_client.list_events_by_incidents(
+                    session=session,
+                    endpoints=self._config.endpoints,
+                    incidents=incidents,
+                )
             except RuntimeError as e:
                 oem_errors.append(str(e))
                 events = []
@@ -1087,11 +1176,11 @@ class AskOpsService:
                 merged_latest.append(rr)
         scenario = None
         if is_alert_related_question(normalized_question):
-        route = classify_alert_scenario(
+            route = classify_alert_scenario(
                 question=normalized_question,
-            alert_scenarios=self._config.alert_scenarios,
-            llm=self._llm_classifier,
-        )
+                alert_scenarios=self._config.alert_scenarios,
+                llm=self._llm_classifier,
+            )
             scenario = route.scenario
         return FetchDataResult(
             session_id=session_id,
@@ -1122,7 +1211,100 @@ class AskOpsService:
         session_id: Optional[str],
         parsed: Any,
     ) -> FetchDataResult:
-        # NL2SQL 是 omr_db 模式的唯一决策者
+        # Oracle 快速健康检查：SYSMAN.MGMT$METRIC_DETAILS 分块模板 SQL，优先于 NL2SQL
+        if is_health_check_question(normalized_question):
+            targets = extract_health_check_targets(normalized_question)
+            if not targets:
+                return FetchDataResult(
+                    session_id=session_id,
+                    need_follow_up=True,
+                    follow_up_question=(
+                        "健康检查需要 1～5 个监控目标名（主机名或数据库实例名等），"
+                        "请写在问题中，例如：「对 host01、db2 做最近 30 分钟健康检查」。"
+                    ),
+                    intent_type=INTENT_SINGLE_DIAGNOSIS,
+                    target_name=parsed.target_name,
+                    target_type_name=parsed.target_type_name,
+                    time_range=parsed.time_range,
+                    metric_keys=parsed.metric_keys,
+                    route_key=parsed.route_key,
+                    scenario=None,
+                    classifier=None,
+                    confidence=None,
+                    latest_data=[],
+                    metric_time_series=[],
+                    incidents=[],
+                    events=[],
+                )
+            minutes = parse_health_check_minutes(normalized_question)
+            include_lock = wants_lock_metrics(normalized_question)
+            try:
+                sub_results = execute_health_check_bundle(
+                    self._omr_client,
+                    targets,
+                    minutes,
+                    include_lock,
+                )
+            except Exception as e:
+                return FetchDataResult(
+                    session_id=session_id,
+                    need_follow_up=True,
+                    follow_up_question=f"健康检查 SQL 执行失败: {e}",
+                    intent_type=INTENT_SINGLE_DIAGNOSIS,
+                    target_name=targets[0] if len(targets) == 1 else ",".join(targets),
+                    target_type_name=parsed.target_type_name,
+                    time_range=parsed.time_range,
+                    metric_keys=parsed.metric_keys,
+                    route_key=parsed.route_key,
+                    scenario=None,
+                    classifier="health_check_template",
+                    confidence=None,
+                    latest_data=[],
+                    metric_time_series=[],
+                    incidents=[],
+                    events=[],
+                )
+            merged_latest: list[dict[str, Any]] = []
+            for i, sub in enumerate(sub_results):
+                for r in sub["latest_data"]:
+                    rr = dict(r)
+                    rr["_sub_query_index"] = i + 1
+                    rr["_sub_question"] = sub["sub_question"]
+                    merged_latest.append(rr)
+            scenario_h: str | None = None
+            if is_alert_related_question(normalized_question):
+                route_h = classify_alert_scenario(
+                    question=normalized_question,
+                    alert_scenarios=self._config.alert_scenarios,
+                    llm=self._llm_classifier,
+                )
+                scenario_h = route_h.scenario
+            tn = targets[0] if len(targets) == 1 else ",".join(targets)
+            return FetchDataResult(
+                session_id=session_id,
+                need_follow_up=False,
+                follow_up_question=None,
+                intent_type=INTENT_SINGLE_DIAGNOSIS,
+                target_name=tn,
+                target_type_name=parsed.target_type_name,
+                time_range=parsed.time_range,
+                metric_keys=parsed.metric_keys,
+                route_key=parsed.route_key,
+                scenario=scenario_h,
+                classifier="health_check_template",
+                confidence=0.9,
+                latest_data=merged_latest,
+                metric_time_series=[],
+                incidents=[],
+                events=[],
+                oem_errors=[],
+                generated_sql=None,
+                sql_source="health_check_template",
+                omr_sub_queries=sub_results,
+                forced_skill_name=ORACLE_HEALTH_CHECK_SKILL_NAME,
+            )
+
+        # NL2SQL 是 omr_db 模式的默认决策者
         plan = self._nl2sql.generate(normalized_question)
         if not plan:
             rejection_detail = ""
@@ -1142,7 +1324,7 @@ class AskOpsService:
                     f"请尝试更具体的问题，例如：'列出所有主机'、'omrd 的当前指标值'、'当前未关闭的告警有哪些'。"
                 ),
                 intent_type=parsed.intent_type,
-            target_name=parsed.target_name,
+                target_name=parsed.target_name,
                 target_type_name=parsed.target_type_name,
                 time_range=parsed.time_range,
                 metric_keys=parsed.metric_keys,

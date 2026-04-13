@@ -50,7 +50,7 @@ isProject: false
 
 ## 测试
 
-- 在 `[tests/](e:\edwin\AIGC\askoem\tests)` 增加针对 `**_build_fetch_data_fact_summary**` 或 `**build_fetch_tool_report**` 的单元测试：构造最小 `FetchDataResult`（多行、多列、一列全为数字字符串），断言摘要中含正确行数与 min/max；空数据断言「未查询到数据」类表述。
+- 在 `[tests/](e:\edwin\AIGC\askoem\tests)` 增加针对 `**_build_fetch_data_fact_summary`** 或 `**build_fetch_tool_report`** 的单元测试：构造最小 `FetchDataResult`（多行、多列、一列全为数字字符串），断言摘要中含正确行数与 min/max；空数据断言「未查询到数据」类表述。
 
 ## 与 LLM 的关系
 

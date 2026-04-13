@@ -205,7 +205,7 @@ export class AssistantOrchestrator {
           title: `Tool result: ${toolName}`,
           detail: toolResultDisplay
         };
-        if (toolName === 'fetch_data_from_oem') {
+        if (toolName === 'fetch_data_from_oem' || toolName === 'run_skill') {
           const fc = buildFetchDataChartsPayload(toolResult, extractQuestionForCharts(resolvedArgs));
           if (fc?.charts?.length) {
             resultStep.fetchCharts = fc;
@@ -349,7 +349,7 @@ export class AssistantOrchestrator {
         title: `Tool result: ${toolName}`,
         detail: safeResult
       };
-      if (toolName === 'fetch_data_from_oem') {
+      if (toolName === 'fetch_data_from_oem' || toolName === 'run_skill') {
         const fc = buildFetchDataChartsPayload(lastResult, extractQuestionForCharts(args));
         if (fc?.charts?.length) {
           chainResultStep.fetchCharts = fc;
@@ -659,6 +659,9 @@ export class AssistantOrchestrator {
       const obj = JSON.parse(trimmed) as Record<string, unknown>;
       if (typeof obj.llm_summary === 'string' && obj.llm_summary.trim().length > 0) {
         return obj.llm_summary.trim();
+      }
+      if (typeof obj.result === 'string' && obj.result.trim().length > 0) {
+        return obj.result.trim();
       }
       if (typeof obj.report === 'string' && obj.report.trim().length > 0) {
         return obj.report.trim();

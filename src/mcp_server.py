@@ -145,6 +145,7 @@ def run_skill(
     oem_base_url: str | None = None,
     username: str | None = None,
     password: str | None = None,
+    skill_name: str | None = None,
 ) -> dict[str, Any]:
     """
     AI 诊断统一入口。
@@ -158,6 +159,8 @@ def run_skill(
     2) 通过 AI Skill Engine（SkillRouter + SkillExecutor）生成诊断
     3) 返回 LLM 生成的结构化诊断文本（结论/证据/SOP建议/下一步）
 
+    可选参数 skill_name：若传入且在注册表中存在，跳过 Skill 路由器直接使用该 Skill（调试或显式指定）。
+
     降级行为：若 DEEPSEEK_API_KEY 未配置或 LLM 调用失败，返回简单文本摘要。
     """
     return service.run_skill_with_llm(
@@ -166,6 +169,7 @@ def run_skill(
         oem_base_url=oem_base_url,
         username=username,
         password=password,
+        skill_name=skill_name,
     )
 
 

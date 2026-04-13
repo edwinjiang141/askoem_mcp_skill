@@ -4,6 +4,8 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from src.oracle_health_check import is_health_check_question
+
 
 INTENT_STATUS = "状态查询"
 INTENT_ALERT_SUMMARY = "告警汇总"
@@ -89,6 +91,8 @@ def _detect_target_type(question: str) -> str:
 
 
 def _detect_intent(question: str) -> str:
+    if is_health_check_question(question):
+        return INTENT_SINGLE_DIAGNOSIS
     q = question.lower()
     if any(k in q for k in ["列出", "清单", "列表", "有哪些"]) and any(
         k in q for k in ["主机", '数据库',"数据库实例","database instsance","database","host", "目标", "监控"]
