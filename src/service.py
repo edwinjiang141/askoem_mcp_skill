@@ -20,10 +20,14 @@ from src.oracle_health_check import (
     extract_health_check_targets,
     is_health_check_question,
     parse_health_check_minutes,
-    wants_lock_metrics,
 )
 from src.oracle_health_tools import run_health_analysis_tools
 from src.skill_engine import AgentSkillsEngine
+
+
+def _sub_query_sql_for_trace(sub: dict[str, Any]) -> str:
+    """工具追踪中展示的 SQL：若有绑定替换结果则优先，否则模板 SQL。"""
+    return str(sub.get("generated_sql_resolved") or sub.get("generated_sql") or "")
 
 
 def _has_time_range_phrase(text: str) -> bool:
@@ -108,6 +112,18 @@ class FetchDataResult:
     def __post_init__(self) -> None:
         if self.oem_errors is None:
             self.oem_errors = []
+
+
+def _is_health_check_fetch_result(fetched: FetchDataResult) -> bool:
+    """健康检查模板取数：必须走 Skill + 脚本工具，不得被 builtin_query_reply 短路。"""
+    if fetched.sql_source == "health_check_template":
+        return True
+    if fetched.forced_skill_name == ORACLE_HEALTH_CHECK_SKILL_NAME:
+        return True
+    for s in fetched.omr_sub_queries or []:
+        if s.get("sql_source") == "health_check_template":
+            return True
+    return False
 
 
 class AskOpsService:
@@ -229,7 +245,11 @@ class AskOpsService:
             )
 
         # 非诊断类问题（如目标清单/监控项清单）直接返回结构化数据结果，避免无意义进入 Skill 路由。
-        if fetched.intent_type in {INTENT_TARGET_LIST, INTENT_METRIC_LIST}:
+        # 健康检查取数（模板 SQL + forced_skill）必须进入 oracle-db-quick-health，不得标成 builtin_query_reply。
+        if (
+            not _is_health_check_fetch_result(fetched)
+            and fetched.intent_type in {INTENT_TARGET_LIST, INTENT_METRIC_LIST}
+        ):
             return self._finalize_run_skill_result(
                 {
                     "ok": True,
@@ -249,7 +269,8 @@ class AskOpsService:
 
         # omr_db 通用数据查询：有数据行且不是诊断类意图 → 直接格式化为文本表格返回
         if (
-            self._config.data_source_mode == "omr_db"
+            not _is_health_check_fetch_result(fetched)
+            and self._config.data_source_mode == "omr_db"
             and fetched.latest_data
             and fetched.intent_type not in {INTENT_SINGLE_DIAGNOSIS, INTENT_TARGET_LIST, INTENT_METRIC_LIST}
         ):
@@ -292,15 +313,14 @@ class AskOpsService:
                 "events": [],
             }
         else:
-            max_ld = 80 if fetched.omr_sub_queries else 10
             context = {
                 "target_name": fetched.target_name,
                 "scenario": fetched.scenario,
                 "time_range": fetched.time_range,
-                "incidents": fetched.incidents[:20],
-                "events": fetched.events[:20],
-                "latest_data": fetched.latest_data[:max_ld],
-                "metric_time_series": fetched.metric_time_series[:10],
+                "incidents": fetched.incidents,
+                "events": fetched.events,
+                "latest_data": fetched.latest_data,
+                "metric_time_series": fetched.metric_time_series,
                 "oem_errors": fetched.oem_errors,
             }
 
@@ -362,6 +382,7 @@ class AskOpsService:
                 {
                     "sub_question": s["sub_question"],
                     "generated_sql": s["generated_sql"],
+                    "generated_sql_resolved": s.get("generated_sql_resolved"),
                     "sql_source": s["sql_source"],
                     "data": {
                         "latest_data": s["latest_data"],
@@ -402,7 +423,7 @@ class AskOpsService:
                 lines.append(f"问题: {sub.get('sub_question', '')}")
                 lines.append(f"来源: {sub.get('sql_source', 'unknown')}")
                 lines.append("SQL:")
-                lines.append(str(sub.get("generated_sql", "")))
+                lines.append(_sub_query_sql_for_trace(sub))
         elif sql:
             lines.append(f"来源: {src or 'unknown'}")
             lines.append("SQL:")
@@ -445,7 +466,7 @@ class AskOpsService:
                 lines.append(f"问题: {sub.get('sub_question', '')}")
                 lines.append(f"来源: {sub.get('sql_source', 'unknown')}")
                 lines.append("SQL:")
-                lines.append(str(sub.get("generated_sql", "")))
+                lines.append(_sub_query_sql_for_trace(sub))
         elif fetched.generated_sql:
             lines.append(f"来源: {fetched.sql_source or 'unknown'}")
             lines.append("SQL:")
@@ -521,7 +542,7 @@ class AskOpsService:
         return "\n".join(out_lines)
 
     def _compact_fetch_payload_for_llm(self, fetched: FetchDataResult) -> str:
-        """供 LLM 总结用的数据片段（JSON 字符串，有长度上限）。"""
+        """供 LLM 总结用的数据片段（JSON 字符串；仅按总长度做防护性截断，不按行数截断）。"""
         if fetched.omr_sub_queries:
             blocks: list[dict[str, Any]] = []
             for s in fetched.omr_sub_queries:
@@ -530,21 +551,21 @@ class AskOpsService:
                     {
                         "sub_question": s.get("sub_question", ""),
                         "row_count": len(rows),
-                        "sample_rows": rows[:40],
+                        "sample_rows": rows,
                     }
                 )
             obj: dict[str, Any] = {"mode": "multi_query", "sub_queries": blocks}
         else:
             obj = {
-                "latest_data": (fetched.latest_data or [])[:50],
-                "metric_time_series": (fetched.metric_time_series or [])[:20],
-                "incidents": (fetched.incidents or [])[:20],
+                "latest_data": fetched.latest_data or [],
+                "metric_time_series": fetched.metric_time_series or [],
+                "incidents": fetched.incidents or [],
                 "events_count": len(fetched.events or []),
             }
         raw = json.dumps(obj, ensure_ascii=False, default=str)
-        max_len = 14000
+        max_len = 500_000
         if len(raw) > max_len:
-            return raw[:max_len] + "\n…(截断)"
+            return raw[:max_len] + "\n…(JSON 总长超限截断)"
         return raw
 
     def build_fetch_llm_summary(self, question: str, fetched: FetchDataResult) -> str:
@@ -681,13 +702,13 @@ class AskOpsService:
         parts: list[str] = []
         if fetched.incidents:
             rows: list[dict[str, str]] = []
-            for r in fetched.incidents[:20]:
+            for r in fetched.incidents:
                 rows.append({
                     "num": str(r.get("incidentNum", r.get("incident_num", "-"))),
                     "summary": str(r.get("summaryMsg", r.get("summary_msg", "-"))),
                     "severity": str(r.get("severity", "-")),
                 })
-            parts.append("incidents（前20条）:\n" + self._format_table(rows, ["num", "summary", "severity"]))
+            parts.append("incidents:\n" + self._format_table(rows, ["num", "summary", "severity"]))
         if fetched.events:
             parts.append(f"events 条数: {len(fetched.events)}（未逐条展开）")
         return "\n\n".join(parts) if parts else "未查询到数据。"
@@ -704,16 +725,15 @@ class AskOpsService:
         )
 
     def _build_sql_result_table_text(self, rows: list[dict[str, Any]]) -> str:
-        """按查询返回的行字典原列输出表格（NL2SQL / 通用结果）。"""
+        """按查询返回的行字典原列输出表格（NL2SQL / 通用结果），不截断行数。"""
         if not rows:
             return "未查询到数据。"
-        slice_rows = rows[:50]
-        headers = AskOpsService._union_keys_in_order(slice_rows)
+        headers = AskOpsService._union_keys_in_order(rows)
         display_rows: list[dict[str, str]] = []
-        for r in slice_rows:
+        for r in rows:
             display_rows.append({h: str(r.get(h, "-")) for h in headers})
         table = self._format_table(display_rows, headers)
-        return f"查询结果（共 {len(rows)} 行，显示前 {min(len(rows), 50)} 行）：\n{table}"
+        return f"查询结果（共 {len(rows)} 行）：\n{table}"
 
     def _build_data_reply(self, fetched: FetchDataResult) -> str:
         """查询结果格式化：统一输出可读文本表格（不依赖 LLM）。"""
@@ -723,7 +743,7 @@ class AskOpsService:
             parts: list[str] = []
             for i, sub in enumerate(fetched.omr_sub_queries, 1):
                 sq = str(sub.get("sub_question", ""))
-                sql = str(sub.get("generated_sql", ""))
+                sql = _sub_query_sql_for_trace(sub)
                 src = str(sub.get("sql_source", ""))
                 sub_rows = sub.get("latest_data") or []
                 parts.append(
@@ -739,7 +759,7 @@ class AskOpsService:
 
         if fetched.intent_type == INTENT_TARGET_LIST:
             normalized: list[dict[str, str]] = []
-            for r in rows[:50]:
+            for r in rows:
                 normalized.append({
                     "target_name": str(r.get("target_name", r.get("targetName", "-"))),
                     "target_type": str(r.get("target_type", r.get("targetType", "-"))),
@@ -750,7 +770,7 @@ class AskOpsService:
 
         if fetched.intent_type == INTENT_METRIC_LIST:
             normalized = []
-            for r in rows[:80]:
+            for r in rows:
                 normalized.append({
                     "metric_group": str(r.get("metricGroupName", r.get("metric_name", "-"))),
                     "metric_column": str(r.get("metricColumn", r.get("metric_column", "-"))),
@@ -765,15 +785,13 @@ class AskOpsService:
     # execute_omr_sql（供 MCP tool 直接执行用户 SQL，仅 omr_db + 与 NL2SQL 相同的安全策略）
     # ------------------------------------------------------------------
 
-    _MAX_EXECUTE_OMR_SQL_ROWS = 500
-
     def execute_omr_sql(self, sql: str, session_id: Optional[str] = None) -> dict[str, Any]:
         """
         在 OMR 上执行用户提交的只读 SQL，返回与 fetch_data_from_oem 成功时一致的字典结构。
 
         输入: sql（单条 SELECT），session_id（可选，仅回显）
         处理: 与 NL2SQL 相同的安全检查 -> OmrClient.execute_sql
-        输出: ok / data / report / generated_sql / sql_source=user
+        输出: ok / data / report / generated_sql / sql_source=user；成功时 result 为完整表格文本（与 _build_sql_result_table_text 一致，不截断行）
         失败: ok False + result + report
         """
         sql_stripped = (sql or "").strip()
@@ -845,9 +863,6 @@ class AskOpsService:
             }
 
         oem_errors: list[str] = []
-        if len(rows) > self._MAX_EXECUTE_OMR_SQL_ROWS:
-            rows = rows[: self._MAX_EXECUTE_OMR_SQL_ROWS]
-            oem_errors.append(f"结果已截断为前 {self._MAX_EXECUTE_OMR_SQL_ROWS} 行")
 
         fetched = FetchDataResult(
             session_id=session_id,
@@ -877,7 +892,9 @@ class AskOpsService:
             1,
         )
         rs = self.build_fetch_data_fact_summary(fetched)
-        llm_s = self.build_fetch_llm_summary(sql_stripped, fetched)
+        table_text = self._build_sql_result_table_text(rows)
+        if oem_errors:
+            table_text = "\n".join(oem_errors) + "\n\n" + table_text
 
         return {
             "ok": True,
@@ -905,8 +922,9 @@ class AskOpsService:
             },
             "report": report,
             "result_summary": rs,
-            "llm_summary": llm_s,
-            "result": llm_s if llm_s else rs,
+            # 主应答区展示表格：若填 llm_summary，扩展会优先显示摘要而非表格
+            "llm_summary": "",
+            "result": table_text,
         }
 
     # ------------------------------------------------------------------
@@ -967,7 +985,7 @@ class AskOpsService:
             host_rows = self._oem_client.list_hosts_with_details(
                 session=session,
                 endpoints=self._config.endpoints,
-                limit=200,
+                limit=100_000,
             )
             return FetchDataResult(
                 session_id=session.session_id,
@@ -994,7 +1012,7 @@ class AskOpsService:
                 endpoints=self._config.endpoints,
                 target_name=parsed.target_name,
                 target_type_name=parsed.target_type_name,
-                limit=200,
+                limit=100_000,
             )
             group_names = [x.get("metricGroupName") for x in groups if isinstance(x.get("metricGroupName"), str)]
             if not group_names:
@@ -1089,7 +1107,7 @@ class AskOpsService:
                     scenario=scenario,
                     question=question,
                     age_hours=24,
-                    limit=50,
+                    limit=100_000,
                 )
             except RuntimeError as e:
                 oem_errors.append(str(e))
@@ -1236,8 +1254,9 @@ class AskOpsService:
                     incidents=[],
                     events=[],
                 )
-            minutes = parse_health_check_minutes(normalized_question)
-            include_lock = wants_lock_metrics(normalized_question)
+            minutes = parse_health_check_minutes(normalized_question, parsed.time_range)
+            # 健康检查默认拉取锁/Enqueue 维度（不依赖问句是否含「锁」）；图表与证据需包含该子查询
+            include_lock = True
             try:
                 sub_results = execute_health_check_bundle(
                     self._omr_client,

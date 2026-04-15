@@ -174,7 +174,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const result = await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
-          title: 'Running alert assistant...'
+          title: 'Running OEM Assistant...'
         },
         async () =>
           orchestrator.ask(userQuestion, ctx, {

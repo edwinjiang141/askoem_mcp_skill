@@ -15,14 +15,14 @@ non_triggers:
   - CPU 高告警单独处置
   - 仅列出主机清单
   - 容量规划与扩容决策
-version: "1.1"
+version: "1.3"
 paradigm: operator
 ---
 
 # Oracle DB Quick Health Check
 
 ## Goal
-`context.health_tool_results` 已由 **`src/oracle_health_tools.py`** 运行完成：分块形态、IO/Wait 跨块对照、OEM 控制台入口 URL。LLM **不得**根据原始指标行自行重算尖峰或跨块关系，只负责将已有结构化结果写成可读四段。
+取数层固定包含 **CPU / 内存 / IO / Wait / 会话 / 锁（Enqueue）** 六类子查询（锁不依赖问句是否含「锁」）。`context.health_tool_results` 由 **`src/oracle_health_tools.py`** 运行完成：分块形态、IO/Wait 跨块对照、OEM 控制台入口 URL。LLM **不得**根据原始指标行自行重算尖峰或跨块关系，只负责将已有结构化结果写成可读四段。
 
 ## 预置工具（脚本，非 LLM）
 | 工具 | 实现位置 | 作用 |

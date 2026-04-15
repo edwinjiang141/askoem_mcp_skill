@@ -14,6 +14,53 @@ from langchain_openai import ChatOpenAI
 load_dotenv()
 
 
+def parse_explicit_row_limit(question: str) -> Optional[int]:
+    """
+    从用户问题中解析「显式结果条数」。
+    输入: 自然语言问题。
+    输出: 正整数条数；未要求限制时返回 None。
+    """
+    if not (question or "").strip():
+        return None
+    s = question.strip()
+    patterns = [
+        r"(?:前|最前|仅|只)\s*(\d{1,6})\s*条",
+        r"取\s*(?:前)?\s*(\d{1,6})\s*条",
+        r"最\s*多\s*(\d{1,6})\s*条",
+        r"(?i)\blimit\s+(\d{1,6})\b",
+        r"(?i)\btop\s+(\d{1,6})\b",
+        r"(?i)first\s+(\d{1,6})\s+rows?",
+        r"(?i)fetch\s+first\s+(\d{1,6})",
+        r"(\d{1,6})\s*条\s*记录",
+    ]
+    for pat in patterns:
+        m = re.search(pat, s)
+        if m:
+            return max(1, min(int(m.group(1)), 1_000_000))
+    return None
+
+
+def _finalize_template_sql(
+    select_wrapped_subquery: str,
+    question: str,
+    *,
+    implied_limit: Optional[int] = None,
+) -> str:
+    """
+    输入: 形如 SELECT ... FROM ( 内层 ... ORDER BY ... )，末尾无 ROWNUM、无别名。
+    处理: implied_limit 优先；否则用 parse_explicit_row_limit(question)。
+    输出: 有条数要求时追加 WHERE ROWNUM <= N；否则追加表别名 q（Oracle 内联视图）。
+    """
+    n = implied_limit if implied_limit is not None else parse_explicit_row_limit(question)
+    s = select_wrapped_subquery.strip().rstrip()
+    if n is None:
+        if re.search(r"\)\s*$", s):
+            return f"{s} q"
+        return s
+    cap = max(1, min(int(n), 1_000_000))
+    return f"{s} WHERE ROWNUM <= {cap}"
+
+
 @dataclass
 class SqlPlan:
     sql: str
@@ -304,64 +351,67 @@ Wait Class Name
 
 
 FEW_SHOT_EXAMPLES = """
-示例（严格参考这些模式生成 SQL）：
+示例（严格参考这些模式生成 SQL；未写清条数时不要加 ROWNUM；内联视图用别名 q）：
 
 Q: "查看 omrd 数据库的活动会话数"
-A: {{"sql":"SELECT target_name, column_label, value, collection_timestamp FROM ( SELECT target_name, column_label, value, collection_timestamp FROM sysman.mgmt$metric_current WHERE LOWER(target_name) = LOWER('omrd') AND (column_label LIKE '%Session%' OR column_label LIKE '%Logon%') ORDER BY collection_timestamp DESC ) WHERE ROWNUM <= 20"}}
+A: {{"sql":"SELECT target_name, column_label, value, collection_timestamp FROM ( SELECT target_name, column_label, value, collection_timestamp FROM sysman.mgmt$metric_current WHERE LOWER(target_name) = LOWER('omrd') AND (column_label LIKE '%Session%' OR column_label LIKE '%Logon%') ORDER BY collection_timestamp DESC ) q"}}
 
 Q: "列出所有主机"
-A: {{"sql":"SELECT target_name, target_type, host_name, display_name FROM ( SELECT target_name, target_type, host_name, display_name FROM mgmt$target WHERE target_type = 'host' ORDER BY target_name ) WHERE ROWNUM <= 200"}}
+A: {{"sql":"SELECT target_name, target_type, host_name, display_name FROM ( SELECT target_name, target_type, host_name, display_name FROM mgmt$target WHERE target_type = 'host' ORDER BY target_name ) q"}}
+
+Q: "只取前 50 条列出所有主机"
+A: {{"sql":"SELECT target_name, target_type, host_name, display_name FROM ( SELECT target_name, target_type, host_name, display_name FROM mgmt$target WHERE target_type = 'host' ORDER BY target_name ) WHERE ROWNUM <= 50"}}
 
 Q: "omrd 的 CPU 使用率是多少"
-A: {{"sql":"SELECT target_name, column_label, value, collection_timestamp FROM ( SELECT target_name, column_label, value, collection_timestamp FROM sysman.mgmt$metric_current WHERE LOWER(target_name) = LOWER('omrd') AND (column_label LIKE '%CPU%') ORDER BY collection_timestamp DESC ) WHERE ROWNUM <= 20"}}
+A: {{"sql":"SELECT target_name, column_label, value, collection_timestamp FROM ( SELECT target_name, column_label, value, collection_timestamp FROM sysman.mgmt$metric_current WHERE LOWER(target_name) = LOWER('omrd') AND (column_label LIKE '%CPU%') ORDER BY collection_timestamp DESC ) q"}}
 
 Q: "当前有哪些未关闭的告警"
-A: {{"sql":"SELECT incident_num, summary_msg, severity, priority, last_updated_date FROM ( SELECT incident_num, summary_msg, severity, priority, last_updated_date FROM mgmt$incidents WHERE open_status = 1 ORDER BY last_updated_date DESC ) WHERE ROWNUM <= 100"}}
+A: {{"sql":"SELECT incident_num, summary_msg, severity, priority, last_updated_date FROM ( SELECT incident_num, summary_msg, severity, priority, last_updated_date FROM mgmt$incidents WHERE open_status = 1 ORDER BY last_updated_date DESC ) q"}}
 
 Q: "列出当前 19c 主机的告警有哪些"
-A: {{"sql":"SELECT incident_num, summary_msg, severity, priority, last_updated_date, target_name, target_type FROM ( SELECT i.incident_num, i.summary_msg, i.severity, i.priority, i.last_updated_date, t.target_name, t.target_type FROM mgmt$incidents i INNER JOIN mgmt$target t ON i.target_guid = t.target_guid WHERE i.open_status = 1 AND (LOWER(t.target_type) = 'host' OR LOWER(t.target_type) = 'oracle_database') ORDER BY i.last_updated_date DESC ) WHERE ROWNUM <= 100"}}
+A: {{"sql":"SELECT incident_num, summary_msg, severity, priority, last_updated_date, target_name, target_type FROM ( SELECT i.incident_num, i.summary_msg, i.severity, i.priority, i.last_updated_date, t.target_name, t.target_type FROM mgmt$incidents i INNER JOIN mgmt$target t ON i.target_guid = t.target_guid WHERE i.open_status = 1 AND (LOWER(t.target_type) = 'host' OR LOWER(t.target_type) = 'oracle_database') ORDER BY i.last_updated_date DESC ) q"}}
 
 Q: "omrd 数据库的内存使用情况"
-A: {{"sql":"SELECT target_name, column_label, value, collection_timestamp FROM ( SELECT target_name, column_label, value, collection_timestamp FROM sysman.mgmt$metric_current WHERE LOWER(target_name) = LOWER('omrd') AND (column_label LIKE '%Memory%' OR column_label LIKE '%SGA%' OR column_label LIKE '%PGA%') ORDER BY collection_timestamp DESC ) WHERE ROWNUM <= 30"}}
+A: {{"sql":"SELECT target_name, column_label, value, collection_timestamp FROM ( SELECT target_name, column_label, value, collection_timestamp FROM sysman.mgmt$metric_current WHERE LOWER(target_name) = LOWER('omrd') AND (column_label LIKE '%Memory%' OR column_label LIKE '%SGA%' OR column_label LIKE '%PGA%') ORDER BY collection_timestamp DESC ) q"}}
 
 Q: "omrd 数据库的 I/O 性能"
-A: {{"sql":"SELECT target_name, column_label, value, collection_timestamp FROM ( SELECT target_name, column_label, value, collection_timestamp FROM sysman.mgmt$metric_current WHERE LOWER(target_name) = LOWER('omrd') AND (column_label LIKE '%I/O%' OR column_label LIKE '%Physical Read%' OR column_label LIKE '%Physical Write%') ORDER BY collection_timestamp DESC ) WHERE ROWNUM <= 30"}}
+A: {{"sql":"SELECT target_name, column_label, value, collection_timestamp FROM ( SELECT target_name, column_label, value, collection_timestamp FROM sysman.mgmt$metric_current WHERE LOWER(target_name) = LOWER('omrd') AND (column_label LIKE '%I/O%' OR column_label LIKE '%Physical Read%' OR column_label LIKE '%Physical Write%') ORDER BY collection_timestamp DESC ) q"}}
 
 Q: "omrd 的等待事件情况"
-A: {{"sql":"SELECT target_name, column_label, value, collection_timestamp FROM ( SELECT target_name, column_label, value, collection_timestamp FROM sysman.mgmt$metric_current WHERE LOWER(target_name) = LOWER('omrd') AND (column_label LIKE '%Wait%') ORDER BY collection_timestamp DESC ) WHERE ROWNUM <= 30"}}
+A: {{"sql":"SELECT target_name, column_label, value, collection_timestamp FROM ( SELECT target_name, column_label, value, collection_timestamp FROM sysman.mgmt$metric_current WHERE LOWER(target_name) = LOWER('omrd') AND (column_label LIKE '%Wait%') ORDER BY collection_timestamp DESC ) q"}}
 
 Q: "哪些目标当前不可用"
-A: {{"sql":"SELECT target_name, target_type, availability_status, start_collection_timestamp FROM ( SELECT target_name, target_type, availability_status, start_collection_timestamp FROM sysman.mgmt$availability_current WHERE availability_status != 'Target Up' ORDER BY start_collection_timestamp DESC ) WHERE ROWNUM <= 100"}}
+A: {{"sql":"SELECT target_name, target_type, availability_status, start_collection_timestamp FROM ( SELECT target_name, target_type, availability_status, start_collection_timestamp FROM sysman.mgmt$availability_current WHERE availability_status != 'Target Up' ORDER BY start_collection_timestamp DESC ) q"}}
 
 Q: "列出 omrdb 内存和 CPU 使用量，各取排名前三的指标"
 A: {{"sql":"SELECT target_name, metric_name, column_label, value, collection_timestamp FROM ( SELECT target_name, metric_name, column_label, value, collection_timestamp FROM sysman.mgmt$metric_current WHERE LOWER(target_name) = LOWER('omrdb') AND ( LOWER(metric_name) LIKE '%load%' OR LOWER(metric_name) = 'load' OR LOWER(column_label) LIKE '%cpu%' OR LOWER(column_label) LIKE '%cpu time%' ) ORDER BY value DESC NULLS LAST ) WHERE ROWNUM <= 3 UNION ALL SELECT target_name, metric_name, column_label, value, collection_timestamp FROM ( SELECT target_name, metric_name, column_label, value, collection_timestamp FROM sysman.mgmt$metric_current WHERE LOWER(target_name) = LOWER('omrdb') AND ( LOWER(metric_name) LIKE '%memory%' OR LOWER(column_label) LIKE '%memory%' OR LOWER(column_label) LIKE '%sga%' OR LOWER(column_label) LIKE '%pga%' OR LOWER(column_label) LIKE '%buffer cache%' ) ORDER BY value DESC NULLS LAST ) WHERE ROWNUM <= 3"}}
 
 Q: "查看 omrd 数据库过去一周 CPU 指标的变化趋势"
-A: {{"sql":"SELECT target_name, column_label, value, collection_timestamp FROM ( SELECT target_name, column_label, value, collection_timestamp FROM sysman.mgmt$metric_details WHERE LOWER(target_name) = LOWER('omrd') AND ( column_label LIKE '%CPU%' OR column_label LIKE '%cpu time%' OR LOWER(metric_name) LIKE '%load%' ) AND collection_timestamp >= SYSTIMESTAMP - INTERVAL '7' DAY AND collection_timestamp <= SYSTIMESTAMP ORDER BY collection_timestamp ) WHERE ROWNUM <= 500"}}
+A: {{"sql":"SELECT target_name, column_label, value, collection_timestamp FROM ( SELECT target_name, column_label, value, collection_timestamp FROM sysman.mgmt$metric_details WHERE LOWER(target_name) = LOWER('omrd') AND ( column_label LIKE '%CPU%' OR column_label LIKE '%cpu time%' OR LOWER(metric_name) LIKE '%load%' ) AND collection_timestamp >= SYSTIMESTAMP - INTERVAL '7' DAY AND collection_timestamp <= SYSTIMESTAMP ORDER BY collection_timestamp ) q"}}
 
 Q: "omrdb 最近 3 天内存相关指标的采集数据"
-A: {{"sql":"SELECT target_name, metric_name, column_label, value, collection_timestamp FROM ( SELECT target_name, metric_name, column_label, value, collection_timestamp FROM sysman.mgmt$metric_details WHERE LOWER(target_name) = LOWER('omrdb') AND ( column_label LIKE '%Memory%' OR column_label LIKE '%SGA%' OR column_label LIKE '%PGA%' OR LOWER(metric_name) LIKE '%memory%' ) AND collection_timestamp >= SYSTIMESTAMP - INTERVAL '3' DAY AND collection_timestamp <= SYSTIMESTAMP ORDER BY collection_timestamp DESC ) WHERE ROWNUM <= 500"}}
+A: {{"sql":"SELECT target_name, metric_name, column_label, value, collection_timestamp FROM ( SELECT target_name, metric_name, column_label, value, collection_timestamp FROM sysman.mgmt$metric_details WHERE LOWER(target_name) = LOWER('omrdb') AND ( column_label LIKE '%Memory%' OR column_label LIKE '%SGA%' OR column_label LIKE '%PGA%' OR LOWER(metric_name) LIKE '%memory%' ) AND collection_timestamp >= SYSTIMESTAMP - INTERVAL '3' DAY AND collection_timestamp <= SYSTIMESTAMP ORDER BY collection_timestamp DESC ) q"}}
 
 Q: "omrd 今天 9 点到 18 点的数据库 CPU 时间指标"
-A: {{"sql":"SELECT target_name, column_label, value, collection_timestamp FROM ( SELECT target_name, column_label, value, collection_timestamp FROM sysman.mgmt$metric_details WHERE LOWER(target_name) = LOWER('omrd') AND ( column_label LIKE '%CPU Time%' OR column_label LIKE '%CPU%' ) AND collection_timestamp >= TRUNC(SYSTIMESTAMP) + INTERVAL '9' HOUR AND collection_timestamp < TRUNC(SYSTIMESTAMP) + INTERVAL '18' HOUR ORDER BY collection_timestamp ) WHERE ROWNUM <= 2000"}}
+A: {{"sql":"SELECT target_name, column_label, value, collection_timestamp FROM ( SELECT target_name, column_label, value, collection_timestamp FROM sysman.mgmt$metric_details WHERE LOWER(target_name) = LOWER('omrd') AND ( column_label LIKE '%CPU Time%' OR column_label LIKE '%CPU%' ) AND collection_timestamp >= TRUNC(SYSTIMESTAMP) + INTERVAL '9' HOUR AND collection_timestamp < TRUNC(SYSTIMESTAMP) + INTERVAL '18' HOUR ORDER BY collection_timestamp ) q"}}
 
 Q: "omrd 最近 15 分钟内采集到的 Session 相关指标"
-A: {{"sql":"SELECT target_name, column_label, value, collection_timestamp FROM ( SELECT target_name, column_label, value, collection_timestamp FROM sysman.mgmt$metric_details WHERE LOWER(target_name) = LOWER('omrd') AND ( column_label LIKE '%Session%' OR column_label LIKE '%Logon%' ) AND collection_timestamp >= SYSTIMESTAMP - NUMTODSINTERVAL(15, 'MINUTE') AND collection_timestamp <= SYSTIMESTAMP ORDER BY collection_timestamp DESC ) WHERE ROWNUM <= 500"}}
+A: {{"sql":"SELECT target_name, column_label, value, collection_timestamp FROM ( SELECT target_name, column_label, value, collection_timestamp FROM sysman.mgmt$metric_details WHERE LOWER(target_name) = LOWER('omrd') AND ( column_label LIKE '%Session%' OR column_label LIKE '%Logon%' ) AND collection_timestamp >= SYSTIMESTAMP - NUMTODSINTERVAL(15, 'MINUTE') AND collection_timestamp <= SYSTIMESTAMP ORDER BY collection_timestamp DESC ) q"}}
 
 Q: "How do I find all hosts with more than 1 percent CPU utilization?"
-A: {{"sql":"SELECT target_name, target_type, column_label, value, collection_timestamp, metric_name, metric_column FROM ( SELECT target_name, target_type, column_label, value, collection_timestamp, metric_name, metric_column FROM sysman.mgmt$metric_current WHERE target_type = 'host' AND metric_name = 'Load' AND metric_column = 'cpuUtil' AND REGEXP_LIKE(TRIM(value), '^[0-9]+(\\.[0-9]*)$') AND TO_NUMBER(TRIM(value)) > 1 ORDER BY TO_NUMBER(TRIM(value)) DESC NULLS LAST ) WHERE ROWNUM <= 200"}}
+A: {{"sql":"SELECT target_name, target_type, column_label, value, collection_timestamp, metric_name, metric_column FROM ( SELECT target_name, target_type, column_label, value, collection_timestamp, metric_name, metric_column FROM sysman.mgmt$metric_current WHERE target_type = 'host' AND metric_name = 'Load' AND metric_column = 'cpuUtil' AND REGEXP_LIKE(TRIM(value), '^[0-9]+(\\.[0-9]*)$') AND TO_NUMBER(TRIM(value)) > 1 ORDER BY TO_NUMBER(TRIM(value)) DESC NULLS LAST ) q"}}
 
 Q: "How do I get the info of host (platform, version, memory, disk)?"
-A: {{"sql":"SELECT target_name, target_type, property_name, property_value FROM ( SELECT target_name, target_type, property_name, property_value FROM sysman.mgmt$target_properties WHERE target_type = 'host' AND ( LOWER(property_name) LIKE '%platform%' OR LOWER(property_name) LIKE '%processor%' OR LOWER(property_name) LIKE '%version%' OR LOWER(property_name) LIKE '%memory%' OR LOWER(property_name) LIKE '%disk%' OR LOWER(property_name) LIKE '%storage%' OR LOWER(property_name) LIKE '%operating%' OR LOWER(property_name) LIKE '%os %' OR LOWER(property_name) LIKE '%cores%' ) ORDER BY target_name, property_name ) WHERE ROWNUM <= 800"}}
+A: {{"sql":"SELECT target_name, target_type, property_name, property_value FROM ( SELECT target_name, target_type, property_name, property_value FROM sysman.mgmt$target_properties WHERE target_type = 'host' AND ( LOWER(property_name) LIKE '%platform%' OR LOWER(property_name) LIKE '%processor%' OR LOWER(property_name) LIKE '%version%' OR LOWER(property_name) LIKE '%memory%' OR LOWER(property_name) LIKE '%disk%' OR LOWER(property_name) LIKE '%storage%' OR LOWER(property_name) LIKE '%operating%' OR LOWER(property_name) LIKE '%os %' OR LOWER(property_name) LIKE '%cores%' ) ORDER BY target_name, property_name ) q"}}
 
 Q: "How do I view a list of all database or RAC targets that have the tablespace thresholds set to between 15 and 25?"
-A: {{"sql":"SELECT target_name, target_type, metric_name, metric_column, warning_threshold, critical_threshold, key_value FROM ( SELECT target_name, target_type, metric_name, metric_column, warning_threshold, critical_threshold, key_value FROM sysman.mgmt$target_metric_settings WHERE target_type IN ('oracle_database', 'rac_database') AND ( LOWER(metric_name) LIKE '%tablespace%' OR LOWER(metric_name) LIKE '%tbsp%' OR metric_name = 'problemTbsp' ) AND ( (REGEXP_LIKE(TRIM(warning_threshold), '^[0-9]+(\\.[0-9]*)$') AND TO_NUMBER(TRIM(warning_threshold)) BETWEEN 15 AND 25) OR (REGEXP_LIKE(TRIM(critical_threshold), '^[0-9]+(\\.[0-9]*)$') AND TO_NUMBER(TRIM(critical_threshold)) BETWEEN 15 AND 25) ) ORDER BY target_name, metric_name, metric_column ) WHERE ROWNUM <= 500"}}
+A: {{"sql":"SELECT target_name, target_type, metric_name, metric_column, warning_threshold, critical_threshold, key_value FROM ( SELECT target_name, target_type, metric_name, metric_column, warning_threshold, critical_threshold, key_value FROM sysman.mgmt$target_metric_settings WHERE target_type IN ('oracle_database', 'rac_database') AND ( LOWER(metric_name) LIKE '%tablespace%' OR LOWER(metric_name) LIKE '%tbsp%' OR metric_name = 'problemTbsp' ) AND ( (REGEXP_LIKE(TRIM(warning_threshold), '^[0-9]+(\\.[0-9]*)$') AND TO_NUMBER(TRIM(warning_threshold)) BETWEEN 15 AND 25) OR (REGEXP_LIKE(TRIM(critical_threshold), '^[0-9]+(\\.[0-9]*)$') AND TO_NUMBER(TRIM(critical_threshold)) BETWEEN 15 AND 25) ) ORDER BY target_name, metric_name, metric_column ) q"}}
 
 Q: "列出表空间利用率高于15小于30的数据库对象"
-A: {{"sql":"SELECT target_name, target_type, metric_name, metric_column, column_label, key_value, value, collection_timestamp FROM ( SELECT target_name, target_type, metric_name, metric_column, column_label, key_value, value, collection_timestamp FROM sysman.mgmt$metric_current WHERE target_type IN ('oracle_database', 'rac_database') AND ( LOWER(metric_name) LIKE '%tablespace%' OR LOWER(metric_name) LIKE '%tbsp%' OR LOWER(metric_name) LIKE '%problem%' OR metric_name = 'problemTbsp' ) AND ( LOWER(column_label) LIKE '%space used%' OR LOWER(column_label) LIKE '%tablespace%space%used%' OR ( LOWER(column_label) LIKE '%used%' AND LOWER(column_label) LIKE '%tablespace%' ) OR LOWER(metric_column) LIKE '%pct%used%' OR LOWER(metric_column) LIKE '%pctused%' ) AND value > 15 AND value < 30 ORDER BY value DESC NULLS LAST ) WHERE ROWNUM <= 500"}}
+A: {{"sql":"SELECT target_name, target_type, metric_name, metric_column, column_label, key_value, value, collection_timestamp FROM ( SELECT target_name, target_type, metric_name, metric_column, column_label, key_value, value, collection_timestamp FROM sysman.mgmt$metric_current WHERE target_type IN ('oracle_database', 'rac_database') AND ( LOWER(metric_name) LIKE '%tablespace%' OR LOWER(metric_name) LIKE '%tbsp%' OR LOWER(metric_name) LIKE '%problem%' OR metric_name = 'problemTbsp' ) AND ( LOWER(column_label) LIKE '%space used%' OR LOWER(column_label) LIKE '%tablespace%space%used%' OR ( LOWER(column_label) LIKE '%used%' AND LOWER(column_label) LIKE '%tablespace%' ) OR LOWER(metric_column) LIKE '%pct%used%' OR LOWER(metric_column) LIKE '%pctused%' ) AND value > 15 AND value < 30 ORDER BY value DESC NULLS LAST ) q"}}
 
 Q: "列出 omrdb 数据库表空间利用率大于 15 percent 的信息"
-A: {{"sql":"SELECT target_name, target_type, metric_name, metric_column, column_label, key_value, value, collection_timestamp FROM ( SELECT target_name, target_type, metric_name, metric_column, column_label, key_value, value, collection_timestamp FROM sysman.mgmt$metric_current WHERE target_type IN ('oracle_database', 'rac_database') AND LOWER(target_name) = LOWER('omrdb') AND ( LOWER(metric_name) LIKE '%tablespace%' OR LOWER(metric_name) LIKE '%tbsp%' OR LOWER(metric_name) LIKE '%problem%' OR metric_name = 'problemTbsp' ) AND ( LOWER(column_label) LIKE '%space used%' OR LOWER(column_label) LIKE '%tablespace%space%used%' OR ( LOWER(column_label) LIKE '%used%' AND LOWER(column_label) LIKE '%tablespace%' ) OR LOWER(metric_column) LIKE '%pct%used%' OR LOWER(metric_column) LIKE '%pctused%' ) AND value >= 0.15 ORDER BY value DESC NULLS LAST ) WHERE ROWNUM <= 500"}}
+A: {{"sql":"SELECT target_name, target_type, metric_name, metric_column, column_label, key_value, value, collection_timestamp FROM ( SELECT target_name, target_type, metric_name, metric_column, column_label, key_value, value, collection_timestamp FROM sysman.mgmt$metric_current WHERE target_type IN ('oracle_database', 'rac_database') AND LOWER(target_name) = LOWER('omrdb') AND ( LOWER(metric_name) LIKE '%tablespace%' OR LOWER(metric_name) LIKE '%tbsp%' OR LOWER(metric_name) LIKE '%problem%' OR metric_name = 'problemTbsp' ) AND ( LOWER(column_label) LIKE '%space used%' OR LOWER(column_label) LIKE '%tablespace%space%used%' OR ( LOWER(column_label) LIKE '%used%' AND LOWER(column_label) LIKE '%tablespace%' ) OR LOWER(metric_column) LIKE '%pct%used%' OR LOWER(metric_column) LIKE '%pctused%' ) AND value >= 0.15 ORDER BY value DESC NULLS LAST ) q"}}
 """.strip()
 
 
@@ -398,12 +448,12 @@ class OemNl2SqlEngine:
                             "3. 只使用上述列出的视图，禁止使用 V$SESSION、V$PROCESS 等数据库动态视图\n"
                             "4. 指标数据：只要「当前快照/最新值」用 SYSMAN.MGMT$METRIC_CURRENT + COLUMN_LABEL LIKE；"
                             "若问题涉及时间范围（一周、几天、某时段、几点到几点、最近 N 分钟等）且需要多条不同采集时间，必须用 SYSMAN.MGMT$METRIC_DETAILS，WHERE 用 COLLECTION_TIMESTAMP 限定范围\n"
-                            "5. 限制行数时用 Oracle 常规写法：内层 SELECT … ORDER BY …，外层 WHERE ROWNUM <= N（不要用 FETCH FIRST）\n"
+                            "5. 结果行数：仅当用户在问题中明确写清条数（如前 N 条、取 N 条、limit N、top N 等）时，才用内层 SELECT … ORDER BY …，外层 WHERE ROWNUM <= N（不要用 FETCH FIRST）。未要求条数时不要加 ROWNUM；用内联视图时最外层加表别名，如 ) q\n"
                             "6. 如果问题中提到了目标名称，用 WHERE LOWER(TARGET_NAME) = LOWER('目标名') 过滤\n"
                             "7. 参考上方的示例 Q&A 来理解中文概念到 COLUMN_LABEL 的映射关系\n"
                             "8. 禁止在 MGMT$INCIDENTS 上直接使用 TARGET_NAME 或 TARGET_TYPE；必须先 JOIN MGMT$TARGET\n"
-                            "9. 若问题要求「CPU 与内存各取前 N 条 / 各排名前三 / top N」：两段各自「内层 ORDER BY value DESC NULLS LAST，外层 WHERE ROWNUM <= N」，再用 UNION ALL 合并；总行数 = 2×N（禁止大结果集只写 ROWNUM<=20/30 敷衍）\n"
-                            "10. 若问题要求 K 类指标（如 CPU、内存、磁盘、I/O、网络）各取前 N 条：写 K 段子查询，每段 WHERE 过滤一类 COLUMN_LABEL/METRIC_NAME，内层 ORDER BY value DESC NULLS LAST，外层 WHERE ROWNUM <= N，再用 UNION ALL 拼成一条 SELECT；总行数 = K×N\n"
+                            "9. 若问题要求「CPU 与内存各取前 N 条 / 各排名前三 / top N」：两段各自「内层 ORDER BY value DESC NULLS LAST，外层 WHERE ROWNUM <= N」，再用 UNION ALL 合并；N 必须来自用户表述\n"
+                            "10. 若问题要求 K 类指标各取前 N 条：写 K 段子查询，每段内层 ORDER BY value DESC NULLS LAST，外层 WHERE ROWNUM <= N，再用 UNION ALL 拼成一条 SELECT；仅当用户明确 N 时如此写\n"
                             "11. 时间范围类问题：FROM 选 SYSMAN.MGMT$METRIC_DETAILS，条件含 collection_timestamp >= … AND collection_timestamp <= …（可用 SYSTIMESTAMP、INTERVAL、TRUNC、NUMTODSINTERVAL）；禁止仅用 MGMT$METRIC_CURRENT 冒充时间序列\n"
                             "12. MGMT$METRIC_CURRENT.VALUE 为 VARCHAR；表空间利用率等可写 VALUE 与数字字面量比较（隐式转数字）；其它场景优先 TO_NUMBER(TRIM(VALUE))。MGMT$METRIC_DETAILS.VALUE 同理。\n"
                             "13. 英文「hosts with more than N percent CPU utilization」类：target_type='host' AND metric_name='Load' AND metric_column='cpuUtil'，再 TO_NUMBER 与 N 比较。\n"
@@ -444,7 +494,7 @@ class OemNl2SqlEngine:
         )
         if cpu_pct and wants_cpu_pct and wants_hosts_scope:
             thr = cpu_pct.group(1)
-            return (
+            return _finalize_template_sql(
                 "SELECT target_name, target_type, column_label, value, collection_timestamp, metric_name, metric_column "
                 "FROM ( "
                 "SELECT target_name, target_type, column_label, value, collection_timestamp, metric_name, metric_column "
@@ -455,7 +505,8 @@ class OemNl2SqlEngine:
                 "AND REGEXP_LIKE(TRIM(value), '^[0-9]+(\\.[0-9]*)$') "
                 f"AND TO_NUMBER(TRIM(value)) > {thr} "
                 "ORDER BY TO_NUMBER(TRIM(value)) DESC NULLS LAST "
-                ") WHERE ROWNUM <= 200"
+                ")",
+                normalized,
             )
 
         # 表空间当前利用率：直接 VALUE 与数字字面量比较（隐式转数字），避免 REGEXP_LIKE 过严导致无行；percent 语义阈值用 N/100
@@ -576,11 +627,12 @@ class OemNl2SqlEngine:
                     )
                 else:
                     num_cond = f"AND value BETWEEN {lo_s} AND {hi_s} "
-                return (
+                return _finalize_template_sql(
                     f"{ts_select}"
                     f"{num_cond}"
                     "ORDER BY value DESC NULLS LAST "
-                    ") WHERE ROWNUM <= 500"
+                    ")",
+                    normalized,
                 )
 
             thr: Optional[float] = None
@@ -604,11 +656,12 @@ class OemNl2SqlEngine:
             if thr is not None:
                 thr_s = _ts_thr_sql(thr)
                 num_cond = f"AND value >= {thr_s} "
-                return (
+                return _finalize_template_sql(
                     f"{ts_select}"
                     f"{num_cond}"
                     "ORDER BY value DESC NULLS LAST "
-                    ") WHERE ROWNUM <= 500"
+                    ")",
+                    normalized,
                 )
 
         # 表空间告警阈值在 MGMT$TARGET_METRIC_SETTINGS；WARNING_THRESHOLD/CRITICAL_THRESHOLD 为 VARCHAR，须 TO_NUMBER
@@ -629,7 +682,7 @@ class OemNl2SqlEngine:
             )
         ):
             lo, hi = ts_between.group(1), ts_between.group(2)
-            return (
+            return _finalize_template_sql(
                 "SELECT target_name, target_type, metric_name, metric_column, "
                 "warning_threshold, critical_threshold, key_value "
                 "FROM ( "
@@ -650,7 +703,8 @@ class OemNl2SqlEngine:
                 f"   AND TO_NUMBER(TRIM(critical_threshold)) BETWEEN {lo} AND {hi}) "
                 ") "
                 "ORDER BY target_name, metric_name, metric_column "
-                ") WHERE ROWNUM <= 500"
+                ")",
+                normalized,
             )
 
         # platform / version / memory / disk 等：MGMT$TARGET 无这些列，须 TARGET_PROPERTIES
@@ -682,7 +736,7 @@ class OemNl2SqlEngine:
             )
         )
         if asks_host_props:
-            return (
+            return _finalize_template_sql(
                 "SELECT target_name, target_type, property_name, property_value "
                 "FROM ( "
                 "SELECT target_name, target_type, property_name, property_value "
@@ -700,7 +754,8 @@ class OemNl2SqlEngine:
                 "OR LOWER(property_name) LIKE '%cores%' "
                 ") "
                 "ORDER BY target_name, property_name "
-                ") WHERE ROWNUM <= 800"
+                ")",
+                normalized,
             )
 
         if any(k in q for k in ["列出", "list", "目标", "targets", "有哪些"]) and any(
@@ -711,10 +766,11 @@ class OemNl2SqlEngine:
             ):
                 pass
             else:
-                return (
+                return _finalize_template_sql(
                     "SELECT target_name, target_type, display_name, host_name, last_load_time_utc "
                     "FROM ( SELECT target_name, target_type, display_name, host_name, last_load_time_utc "
-                    "FROM mgmt$target ORDER BY last_load_time_utc DESC NULLS LAST ) WHERE ROWNUM <= 200"
+                    "FROM mgmt$target ORDER BY last_load_time_utc DESC NULLS LAST )",
+                    normalized,
                 )
 
         if any(k in q for k in ["监控项", "监控指标", "metric", "metrics"]) and any(
@@ -727,33 +783,36 @@ class OemNl2SqlEngine:
             )
             target_name = target_match.group(1) if target_match else None
             if target_name:
-                return (
+                return _finalize_template_sql(
                     "SELECT target_name, target_type, metric_name, metric_column, metric_label, column_label "
                     "FROM ( SELECT DISTINCT target_name, target_type, metric_name, metric_column, metric_label, column_label "
                     "FROM sysman.mgmt$metric_current "
                     f"WHERE LOWER(target_name)=LOWER('{target_name}') "
-                    "ORDER BY metric_name, metric_column ) WHERE ROWNUM <= 300"
+                    "ORDER BY metric_name, metric_column )",
+                    normalized,
                 )
 
         if any(k in q for k in ["告警", "incident", "事件"]) and any(
             k in q for k in ["未关闭", "open", "当前", "current", "活跃"]
         ):
-            return (
+            return _finalize_template_sql(
                 "SELECT incident_num, summary_msg, severity, priority, owner, open_status, last_updated_date "
                 "FROM ( SELECT incident_num, summary_msg, severity, priority, owner, open_status, last_updated_date "
                 "FROM mgmt$incidents WHERE open_status = 1 "
-                "ORDER BY last_updated_date DESC NULLS LAST ) WHERE ROWNUM <= 100"
+                "ORDER BY last_updated_date DESC NULLS LAST )",
+                normalized,
             )
 
         if any(k in q for k in ["可用性", "availability", "在线", "离线", "down", "up"]):
-            return (
+            return _finalize_template_sql(
                 "SELECT target_name, target_type, availability_status, start_collection_timestamp "
                 "FROM ( SELECT target_name, target_type, availability_status, start_collection_timestamp "
                 "FROM sysman.mgmt$availability_current "
-                "ORDER BY start_collection_timestamp DESC NULLS LAST ) WHERE ROWNUM <= 200"
+                "ORDER BY start_collection_timestamp DESC NULLS LAST )",
+                normalized,
             )
 
-        # CPU + 内存 + 各取前 N（须在「通用指标」模板之前匹配，否则会落到 ROWNUM<=100）
+        # CPU + 内存 + 各取前 N（须在「通用指标」模板之前匹配，否则会落到通用指标分支）
         topn_match = re.search(
             r"(前三|前3|前\s*三|top\s*3|top3|各取\s*(\d+)\s*条|各\s*(\d+)\s*条)",
             normalized,
@@ -829,14 +888,15 @@ class OemNl2SqlEngine:
             target_match = re.search(r"([A-Za-z0-9._-]{2,})", question)
             target_name = target_match.group(1) if target_match else None
             if target_name:
-                return (
+                return _finalize_template_sql(
                     "SELECT target_name, target_type, metric_name, metric_column, "
                     "metric_label, column_label, value, collection_timestamp "
                     "FROM ( SELECT target_name, target_type, metric_name, metric_column, "
                     "metric_label, column_label, value, collection_timestamp "
                     "FROM sysman.mgmt$metric_current "
                     f"WHERE LOWER(target_name) = LOWER('{target_name}') "
-                    "ORDER BY collection_timestamp DESC ) WHERE ROWNUM <= 100"
+                    "ORDER BY collection_timestamp DESC )",
+                    normalized,
                 )
         return None
 
@@ -903,6 +963,21 @@ class OemNl2SqlEngine:
             )
         return True, ""
 
+    @staticmethod
+    def _strip_llm_trailing_rownum_without_user_limit(sql: str, question: str) -> str:
+        """用户未要求条数时去掉 LLM 在末尾自动加的 WHERE ROWNUM <= N，并补内联视图别名 q。"""
+        if parse_explicit_row_limit(question) is not None:
+            return sql
+        if re.search(r"\bunion\s+all\b", sql, re.IGNORECASE):
+            return sql
+        s = sql.strip()
+        s2 = re.sub(r"\s*WHERE\s+ROWNUM\s*<=\s*\d+\s*$", "", s, flags=re.IGNORECASE)
+        if s2 == s:
+            return sql
+        if not re.search(r"\)\s*$", s2.rstrip()):
+            return sql
+        return s2 + " q"
+
     def generate(self, question: str) -> Optional[SqlPlan]:
         """LLM 优先生成 SQL，LLM 不可用或失败时降级到模板。"""
         self.last_rejection = None
@@ -940,6 +1015,7 @@ class OemNl2SqlEngine:
             if not sql:
                 self.last_rejection = SqlRejection(sql="(空)", reason="LLM 返回的 JSON 中 sql 字段为空")
                 return None
+            sql = OemNl2SqlEngine._strip_llm_trailing_rownum_without_user_limit(sql, question)
             safe, reason = self._is_safe_sql(sql)
             if safe:
                 return SqlPlan(sql=sql, source="llm")

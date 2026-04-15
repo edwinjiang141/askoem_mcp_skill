@@ -7,6 +7,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from src.sql_trace import format_sql_for_trace
+
 # 与 skills/oracle_health_check_mvp/SKILL.md frontmatter name 一致
 ORACLE_HEALTH_CHECK_SKILL_NAME = "oracle-db-quick-health"
 
@@ -32,19 +34,95 @@ def wants_lock_metrics(question: str) -> bool:
     return bool(_LOCK_PATTERNS.search(question or ""))
 
 
-def parse_health_check_minutes(question: str) -> int:
-    """解析「最近 N 分钟/小时」；默认 30；clamp 5～1440。"""
-    q = question or ""
-    m = re.search(r"(\d+)\s*(分钟|分|min)", q, re.IGNORECASE)
+def _clamp_minutes(m: int) -> int:
+    return max(5, min(1440, int(m)))
+
+
+def _minutes_from_intent_time_range(hint: str | None) -> int | None:
+    """与 intent_parser._parse_time_range 产物对齐：1h / 24h / 7d。"""
+    if not hint:
+        return None
+    h = str(hint).strip().lower()
+    if h == "1h":
+        return 60
+    if h == "24h":
+        return 1440
+    if h == "7d":
+        return 1440
+    return None
+
+
+def parse_health_check_minutes(question: str, time_range_hint: str | None = None) -> int:
+    """
+    解析巡检时间窗（分钟）。优先从问句抽取；无法抽取时用 intent 的 time_range；再默认 30。
+    clamp 5～1440。
+    """
+    q = (question or "").strip()
+
+    # --- 英文：30 minutes / last 2 hours / 24 hours / 1 day ---
+    m = re.search(r"(?i)(\d+)\s*(minutes?|mins?)\b", q)
     if m:
-        return max(5, min(1440, int(m.group(1))))
-    m = re.search(r"(\d+)\s*(小时|h|hr)\b", q, re.IGNORECASE)
+        return _clamp_minutes(int(m.group(1)))
+    m = re.search(r"(?i)(\d+)\s*(hours?|hrs?)\b", q)
     if m:
-        return max(5, min(1440, int(m.group(1)) * 60))
+        return _clamp_minutes(int(m.group(1)) * 60)
+    m = re.search(r"(?i)(\d+)\s*(hr|h)\b", q)
+    if m:
+        return _clamp_minutes(int(m.group(1)) * 60)
+    m = re.search(r"(?i)(\d+)\s*(days?|day)\b", q)
+    if m:
+        return _clamp_minutes(int(m.group(1)) * 24 * 60)
+
+    # --- 中文：数字 + 分钟/小时/天 ---
+    m = re.search(r"(\d+)\s*分钟", q)
+    if m:
+        return _clamp_minutes(int(m.group(1)))
+    m = re.search(r"(\d+)\s*(小时|钟头|个小时)", q)
+    if m:
+        return _clamp_minutes(int(m.group(1)) * 60)
+    m = re.search(r"(\d+)\s*(天|日)(?![历然])", q)
+    if m:
+        return _clamp_minutes(int(m.group(1)) * 24 * 60)
+
+    # --- 口语：半小时、一两小时、两三个小时 ---
     if "半小时" in q or "半个钟头" in q:
         return 30
-    if "一小时" in q or "1小时" in q or "一个小时" in q:
+    if re.search(r"(一|1)\s*小时", q) or "一小时" in q or "一个小时" in q:
         return 60
+    if re.search(r"(两|俩|二)\s*小时", q) or "两小时" in q:
+        return 120
+    if re.search(r"(三|3)\s*小时", q) or "三小时" in q:
+        return 180
+    if re.search(r"(四|4)\s*小时", q):
+        return 240
+    if re.search(r"(两|俩|二)\s*分钟", q):
+        return _clamp_minutes(2)
+
+    # --- 一天 / 昨天 / 最近一天 / 本周（按天粒度，受 clamp）---
+    if any(
+        x in q
+        for x in (
+            "一天",
+            "一整天",
+            "24小时",
+            "二十四小时",
+            "昨天",
+            "昨日",
+            "最近一天",
+            "今日整天",
+            "今天整天",
+        )
+    ):
+        return 1440
+    if any(x in q for x in ("一周", "七天", "7天", "这周", "过去一周", "最近一周", "最近7天")):
+        return 1440
+
+    # --- 模糊时间词且无上面命中：用 intent 的 time_range（避免无时间句默认成 24h）---
+    if re.search(r"(最近|近来|这几天|这段时间|昨夜|昨日|昨天|过去)", q):
+        hinted = _minutes_from_intent_time_range(time_range_hint)
+        if hinted is not None:
+            return hinted
+
     return 30
 
 
@@ -126,10 +204,10 @@ def build_health_check_sections(
 
     def _wrap(where_metric: str, key: str, label: str) -> HealthCheckSection:
         sql = (
-            f"SELECT /*+ FIRST_ROWS(200) */ target_name, target_type, metric_name, metric_column, "
+            f"SELECT target_name, target_type, metric_name, metric_column, "
             f"column_label, value, collection_timestamp "
             f"FROM sysman.mgmt$metric_details "
-            f"WHERE {time_pred} AND {tw} AND ({where_metric}) AND ROWNUM <= 200"
+            f"WHERE {time_pred} AND {tw} AND ({where_metric})"
         )
         return HealthCheckSection(key=key, label_zh=label, sql=sql, binds=dict(base_binds))
 
@@ -180,9 +258,11 @@ def build_health_check_sections(
         sections.append(
             _wrap(
                 "("
-                "LOWER(column_label) LIKE '%enqueue%' OR LOWER(metric_name) LIKE '%enqueue%' "
+                "LOWER(metric_name) LIKE '%enqueue%' OR LOWER(metric_column) LIKE '%enqueue%' "
+                "OR LOWER(column_label) LIKE '%enqueue%' OR LOWER(metric_name) LIKE '%mtx%' "
+                "OR LOWER(metric_name) LIKE '%lock%' OR LOWER(metric_column) LIKE '%lock%' "
                 "OR LOWER(column_label) LIKE '%deadlock%' OR LOWER(column_label) LIKE '%blocked%' "
-                "OR LOWER(column_label) LIKE '%lock%'"
+                "OR LOWER(column_label) LIKE '%blocking%'"
                 ")",
                 "lock",
                 "锁/Enqueue",
@@ -209,6 +289,7 @@ def execute_health_check_bundle(
             {
                 "sub_question": f"{sec.label_zh}（{sec.key}）",
                 "generated_sql": sec.sql,
+                "generated_sql_resolved": format_sql_for_trace(sec.sql, binds),
                 "sql_source": "health_check_template",
                 "latest_data": rows,
                 "metric_time_series": [],

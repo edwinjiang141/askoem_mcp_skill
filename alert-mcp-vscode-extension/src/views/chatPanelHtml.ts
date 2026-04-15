@@ -78,8 +78,9 @@ export function buildChatPanelHtml(options: {
       background: color-mix(in srgb, var(--vscode-list-hoverBackground) 80%, transparent);
     }
     .conv-item.active {
-      background: color-mix(in srgb, var(--vscode-list-activeSelectionBackground) 35%, transparent);
+      background: color-mix(in srgb, var(--vscode-list-activeSelectionBackground) 50%, transparent);
       border-color: var(--vscode-focusBorder);
+      box-shadow: inset 3px 0 0 var(--vscode-focusBorder);
     }
     .conv-title-text {
       flex: 1;
@@ -993,7 +994,10 @@ export function buildChatPanelHtml(options: {
       }
       if (message.type === 'conversation-activate') {
         const p = message.payload;
-        if (p && p.activeId) currentActiveId = p.activeId;
+        if (p && p.activeId) {
+          currentActiveId = p.activeId;
+          renderConvList(convItems, p.activeId);
+        }
         if (p && p.messages) renderMessages(p.messages);
         return;
       }

@@ -10,6 +10,7 @@ import { SecretStorageService } from '../services/secretStorageService';
 import { OpenAiCompatibleLlmService } from '../services/llm/openAiCompatibleLlmService';
 import { McpClientService } from '../services/mcp/mcpClientService';
 import { buildFetchDataChartsPayload } from '../charts/buildFetchDataChartsPayload';
+import { truncateOemToolResultStringForUi, UI_MAX_DATA_ROWS } from '../utils/truncateOemToolResultForUi';
 
 function extractQuestionForCharts(args: Record<string, unknown>): string {
   const q = args.question ?? args.query ?? args.input ?? args.text;
@@ -199,7 +200,9 @@ export class AssistantOrchestrator {
 
         const toolResult = await this.mcp.callTool(toolName, resolvedArgs);
         const toolResultForLlm = this.prepareToolResultContentForLlm(toolResult);
-        const toolResultDisplay = this.redactSensitiveText(this.formatToolResultForExecutionTrace(toolResult));
+        const toolResultDisplay = this.redactSensitiveText(
+          this.formatToolResultForExecutionTrace(toolResult, UI_MAX_DATA_ROWS)
+        );
         const resultStep: ExecutionStep = {
           type: 'tool-result',
           title: `Tool result: ${toolName}`,
@@ -628,13 +631,17 @@ export class AssistantOrchestrator {
   }
 
   /**
-   * Tool Execution Trace：始终优先展示完整 `report`（含【SQL 执行追踪】），不改为仅 llm_summary。
-   * 若无 `report` 则回退为格式化后的整段 JSON，避免 Trace 中丢失字段。
+   * Tool Execution Trace：优先展示 `report`（含【SQL 执行追踪】）；tabular 数据在展示侧最多 UI_MAX_DATA_ROWS 行。
+   * 图表仍用原始 MCP 返回由 buildFetchDataChartsPayload 解析。
    */
-  private formatToolResultForExecutionTrace(raw: string): string {
-    const trimmed = raw.trim();
+  /**
+   * Tool Execution Trace：优先 report；maxDataRows 仅影响正文展示（图表仍用原始 tool 返回）。
+   */
+  private formatToolResultForExecutionTrace(raw: string, maxDataRows: number = UI_MAX_DATA_ROWS): string {
+    const forUi = truncateOemToolResultStringForUi(raw, maxDataRows);
+    const trimmed = forUi.trim();
     if (!trimmed.startsWith('{')) {
-      return raw;
+      return forUi;
     }
     try {
       const obj = JSON.parse(trimmed) as Record<string, unknown>;
@@ -643,17 +650,18 @@ export class AssistantOrchestrator {
       }
       return JSON.stringify(obj, null, 2);
     } catch {
-      return raw;
+      return forUi;
     }
   }
 
   /**
    * 主回答区 / 链式最终正文：有 llm_summary 时优先短摘要；否则用 report。
    */
-  private formatToolResultForDisplay(raw: string): string {
-    const trimmed = raw.trim();
+  private formatToolResultForDisplay(raw: string, maxDataRows: number = UI_MAX_DATA_ROWS): string {
+    const forUi = truncateOemToolResultStringForUi(raw, maxDataRows);
+    const trimmed = forUi.trim();
     if (!trimmed.startsWith('{')) {
-      return raw;
+      return forUi;
     }
     try {
       const obj = JSON.parse(trimmed) as Record<string, unknown>;
@@ -667,9 +675,9 @@ export class AssistantOrchestrator {
         return obj.report.trim();
       }
     } catch {
-      // keep raw
+      return forUi;
     }
-    return raw;
+    return forUi;
   }
 
   private redactSensitiveText(input: string): string {

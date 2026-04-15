@@ -3,7 +3,30 @@ import type { ChartPreferences } from './parseChartPreferencesFromQuestion';
 import { parseChartPreferencesFromQuestion } from './parseChartPreferencesFromQuestion';
 
 const MAX_CHARTS = 10;
-const MAX_POINTS = 200;
+/** Oracle 快速健康检查：多子查询（CPU/内存/IO/Wait/会话/锁）合并时原 10 张上限会截断末段；提高上限避免锁等维度无图 */
+const HEALTH_CHECK_MAX_CHARTS = 48;
+/** 折线/柱状等按 SQL 返回行数绘制；不在此限制点数（与正文/trace 最多展示 20 行无关）。 */
+
+export type BuildFetchDataChartsPayloadOptions = {
+  /** 递归子查询构建时传入，覆盖默认上限检测 */
+  chartCap?: number;
+};
+
+function isOracleHealthCheckToolResult(root: Record<string, unknown>): boolean {
+  if (root.skill_name === 'oracle-db-quick-health') {
+    return true;
+  }
+  const subs = root.sub_results;
+  if (!Array.isArray(subs) || subs.length === 0) {
+    return false;
+  }
+  return subs.some(s => {
+    if (typeof s !== 'object' || s === null) {
+      return false;
+    }
+    return (s as Record<string, unknown>).sql_source === 'health_check_template';
+  });
+}
 
 const SENSITIVE_KEY = /password|passwd|pwd|secret|token|credential/i;
 
@@ -366,7 +389,7 @@ function buildOneMultiSeriesLineChart(
   if (seriesNames.length < 1 || seriesNames.length > 2) {
     return undefined;
   }
-  const sorted = sortRowsByTime(rows, timeKey).slice(-MAX_POINTS);
+  const sorted = sortRowsByTime(rows, timeKey);
   const timeSet = new Set<string>();
   for (const r of sorted) {
     const col = String(r[columnLabelKey] ?? '').trim();
@@ -423,7 +446,7 @@ function buildMultiSeriesLineCharts(
   columnLabelKey: string,
   title: string
 ): FetchDataChartSpec[] {
-  const sorted = sortRowsByTime(rows, timeKey).slice(-MAX_POINTS);
+  const sorted = sortRowsByTime(rows, timeKey);
   const seriesNames = [
     ...new Set(sorted.map(r => String(r[columnLabelKey] ?? '').trim()).filter(Boolean))
   ].sort((a, b) => a.localeCompare(b));
@@ -465,7 +488,7 @@ function buildLineChartFromRows(
       return buildMultiSeriesLineCharts(rows, timeKey, valKey, clk, title);
     }
   }
-  const sorted = sortRowsByTime(rows, timeKey).slice(-MAX_POINTS);
+  const sorted = sortRowsByTime(rows, timeKey);
   const map = new Map<string, number>();
   for (const r of sorted) {
     const t = labelForTime(r[timeKey]);
@@ -617,7 +640,7 @@ function tryBuildLatestGroupedBarCharts(
     if (!catKey || catKey === valKey) {
       return undefined;
     }
-    const slice = rows.slice(0, MAX_POINTS);
+    const slice = rows;
     const labels = slice.map(r => String(r[catKey] ?? '').slice(0, 40));
     const values = slice.map(r => parseNumber(r[valKey])).map(v => (v === undefined ? 0 : v));
     if (!labels.some(Boolean)) {
@@ -661,7 +684,7 @@ function tryBuildLatestGroupedBarCharts(
         if (!catKey || catKey === valKey) {
           continue;
         }
-        const slice = groupRows.slice(0, MAX_POINTS);
+        const slice = groupRows;
         const labels = slice.map(r => String(r[catKey] ?? '').slice(0, 40));
         const values = slice.map(r => parseNumber(r[valKey])).map(v => (v === undefined ? 0 : v));
         if (!labels.some(Boolean)) {
@@ -954,11 +977,9 @@ function mergeChartPrefsForLatestData(
  */
 export function buildFetchDataChartsPayload(
   rawToolResult: string,
-  userQuestion?: string
+  userQuestion?: string,
+  options?: BuildFetchDataChartsPayloadOptions
 ): FetchDataChartsPayload | undefined {
-  const prefs = parseChartPreferencesFromQuestion(userQuestion ?? '');
-  const capCharts = Math.min(MAX_CHARTS, prefs.maxCharts ?? MAX_CHARTS);
-
   const trimmed = rawToolResult.trim();
   if (!trimmed.startsWith('{')) {
     return undefined;
@@ -972,6 +993,13 @@ export function buildFetchDataChartsPayload(
   if (root.ok !== true) {
     return undefined;
   }
+
+  const prefs = parseChartPreferencesFromQuestion(userQuestion ?? '');
+  const defaultCap =
+    options?.chartCap ??
+    (isOracleHealthCheckToolResult(root) ? HEALTH_CHECK_MAX_CHARTS : MAX_CHARTS);
+  const capCharts = Math.min(defaultCap, prefs.maxCharts ?? defaultCap);
+
   if (root.multi_query === true && Array.isArray(root.sub_results)) {
     const subs = root.sub_results as Array<Record<string, unknown>>;
     const mergedCharts: FetchDataChartSpec[] = [];
@@ -990,7 +1018,9 @@ export function buildFetchDataChartsPayload(
         intent: root.intent,
         routing: root.routing
       };
-      const subPayload = buildFetchDataChartsPayload(JSON.stringify(fakeRoot), subQ);
+      const subPayload = buildFetchDataChartsPayload(JSON.stringify(fakeRoot), subQ, {
+        chartCap: defaultCap
+      });
       const subCharts = subPayload?.charts ?? [];
       for (const c of subCharts) {
         if (mergedCharts.length >= capCharts) {
@@ -1098,7 +1128,7 @@ export function buildFetchDataChartsPayload(
           charts.push(lineSpec);
         }
       } else {
-        const slice = latest.slice(0, MAX_POINTS);
+        const slice = latest;
         const labels = slice.map(r => String(r[catKey] ?? '').slice(0, 40));
         const values = slice.map(r => parseNumber(r[valKey])).map(v => (v === undefined ? 0 : v));
         if (labels.some(Boolean)) {
@@ -1113,7 +1143,7 @@ export function buildFetchDataChartsPayload(
         }
       }
     } else if (timeKey && valKey && !charts.some(c => c.title.includes('latest_data'))) {
-      const sorted = sortRowsByTime(latest, timeKey).slice(-MAX_POINTS);
+      const sorted = sortRowsByTime(latest, timeKey);
       const labels = sorted.map(r => labelForTime(r[timeKey]));
       const values = sorted.map(r => parseNumber(r[valKey])).map(v => (v === undefined ? 0 : v));
       if (labels.length) {
@@ -1131,7 +1161,6 @@ export function buildFetchDataChartsPayload(
       if (pair) {
         const [k1, k2] = pair;
         const pts = latest
-          .slice(0, MAX_POINTS)
           .map(r => {
             const x = parseNumber(r[k1]);
             const y = parseNumber(r[k2]);

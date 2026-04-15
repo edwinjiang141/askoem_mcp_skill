@@ -27,6 +27,12 @@ def test_parse_health_check_minutes() -> None:
     assert parse_health_check_minutes("半小时") == 30
     assert parse_health_check_minutes("无时间") == 30
     assert parse_health_check_minutes("99999 分钟") == 1440
+    assert parse_health_check_minutes("last 24 hours") == 1440
+    assert parse_health_check_minutes("past 2 hours") == 120
+    assert parse_health_check_minutes("昨天 omrd 健康检查") == 1440
+    assert parse_health_check_minutes("最近健康检查", "24h") == 1440
+    assert parse_health_check_minutes("健康检查", "24h") == 30
+    assert parse_health_check_minutes("两小时巡检") == 120
 
 
 def test_extract_targets() -> None:

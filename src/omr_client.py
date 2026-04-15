@@ -19,7 +19,8 @@ class OmrConfig:
     password: str
     dsn: str
     schema: str = "SYSMAN"
-    fetch_limit: int = 200
+    # None 表示不在 SQL 中加 FETCH FIRST（由调用方问题中的条数或 NL2SQL 决定）
+    fetch_limit: Optional[int] = None
 
 
 class OmrClient:
@@ -68,34 +69,45 @@ class OmrClient:
             return end - timedelta(days=7)
         return end - timedelta(hours=24)
 
-    def list_targets(self, target_name: str | None = None, target_type: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+    def list_targets(self, target_name: str | None = None, target_type: str | None = None, limit: Optional[int] = None) -> list[dict[str, Any]]:
         sql = (
             "SELECT target_name, target_type, target_guid, display_name, host_name, "
             "last_metric_load_time, last_load_time_utc "
             "FROM mgmt$target WHERE 1=1 "
         )
-        binds: dict[str, Any] = {"limit_n": max(1, min(limit, self._config.fetch_limit))}
+        binds: dict[str, Any] = {}
         if target_name:
             sql += " AND LOWER(target_name) LIKE LOWER(:target_name)"
             binds["target_name"] = f"%{target_name}%"
         if target_type:
             sql += " AND LOWER(target_type) = LOWER(:target_type)"
             binds["target_type"] = target_type
-        sql += " ORDER BY last_load_time_utc DESC NULLS LAST FETCH FIRST :limit_n ROWS ONLY"
+        sql += " ORDER BY last_load_time_utc DESC NULLS LAST"
+        if limit is not None:
+            cap = limit
+            if self._config.fetch_limit is not None:
+                cap = max(1, min(limit, self._config.fetch_limit))
+            binds["limit_n"] = cap
+            sql += " FETCH FIRST :limit_n ROWS ONLY"
         return self._query(sql, binds)
 
-    def list_metric_groups(self, target_name: str, target_type: str = "host", limit: int = 200) -> list[dict[str, Any]]:
+    def list_metric_groups(self, target_name: str, target_type: str = "host", limit: Optional[int] = None) -> list[dict[str, Any]]:
         sql = (
             "SELECT DISTINCT metric_name, metric_column, metric_label, column_label "
             "FROM sysman.mgmt$metric_current "
             "WHERE LOWER(target_name)=LOWER(:target_name) AND LOWER(target_type)=LOWER(:target_type) "
-            "FETCH FIRST :limit_n ROWS ONLY"
         )
-        rows = self._query(sql, {
+        binds: dict[str, Any] = {
             "target_name": target_name,
             "target_type": target_type,
-            "limit_n": max(1, min(limit, self._config.fetch_limit)),
-        })
+        }
+        if limit is not None:
+            cap = limit
+            if self._config.fetch_limit is not None:
+                cap = max(1, min(limit, self._config.fetch_limit))
+            binds["limit_n"] = cap
+            sql += " FETCH FIRST :limit_n ROWS ONLY"
+        rows = self._query(sql, binds)
         return [{"metricGroupName": x.get("metric_name") or "-", "metricColumn": x.get("metric_column") or ""} for x in rows]
 
     def list_recent_incidents(
@@ -103,7 +115,7 @@ class OmrClient:
         target_name: str | None = None,
         target_type_name: str | None = None,
         age_hours: int = 24,
-        limit: int = 50,
+        limit: Optional[int] = None,
     ) -> list[dict[str, Any]]:
         start_time = datetime.now(timezone.utc) - timedelta(hours=max(1, age_hours))
         sql = (
@@ -114,12 +126,18 @@ class OmrClient:
         )
         binds: dict[str, Any] = {
             "start_time": start_time,
-            "limit_n": max(1, min(limit, self._config.fetch_limit)),
         }
+        if limit is not None:
+            cap = limit
+            if self._config.fetch_limit is not None:
+                cap = max(1, min(limit, self._config.fetch_limit))
+            binds["limit_n"] = cap
         if target_name:
             sql += " AND LOWER(summary_msg) LIKE LOWER(:target_name_like)"
             binds["target_name_like"] = f"%{target_name}%"
-        sql += " ORDER BY last_updated_date DESC NULLS LAST FETCH FIRST :limit_n ROWS ONLY"
+        sql += " ORDER BY last_updated_date DESC NULLS LAST"
+        if limit is not None:
+            sql += " FETCH FIRST :limit_n ROWS ONLY"
         rows = self._query(sql, binds)
         for x in rows:
             x.setdefault("source", "omr_db")
@@ -146,7 +164,7 @@ class OmrClient:
                 "AND LOWER(target_type)=LOWER(:target_type) "
                 "AND metric_name=:metric_name "
                 "AND metric_column=:metric_column "
-                "ORDER BY collection_timestamp DESC FETCH FIRST 50 ROWS ONLY"
+                "ORDER BY collection_timestamp DESC"
             )
             latest_data = self._query(sql, {
                 "target_name": target_name,
@@ -155,10 +173,12 @@ class OmrClient:
                 "metric_column": metric_column,
             })
 
-        # MVP: 先用 metric_current 近似 time_series（按时间倒序截取）
-        metric_time_series = [x for x in latest_data if x.get("collection_timestamp") and x["collection_timestamp"] >= start_time][:50]
+        metric_time_series = [
+            x for x in latest_data
+            if x.get("collection_timestamp") and x["collection_timestamp"] >= start_time
+        ]
 
-        incidents = self.list_recent_incidents(target_name=target_name, target_type_name=target_type, age_hours=24, limit=20)
+        incidents = self.list_recent_incidents(target_name=target_name, target_type_name=target_type, age_hours=24, limit=None)
         return OemDataBundle(
             target=target,
             latest_data=latest_data,

@@ -663,7 +663,22 @@ function parseChartPreferencesFromQuestion(question) {
 
 // src/charts/buildFetchDataChartsPayload.ts
 var MAX_CHARTS = 10;
-var MAX_POINTS = 200;
+var HEALTH_CHECK_MAX_CHARTS = 48;
+function isOracleHealthCheckToolResult(root) {
+  if (root.skill_name === "oracle-db-quick-health") {
+    return true;
+  }
+  const subs = root.sub_results;
+  if (!Array.isArray(subs) || subs.length === 0) {
+    return false;
+  }
+  return subs.some((s) => {
+    if (typeof s !== "object" || s === null) {
+      return false;
+    }
+    return s.sql_source === "health_check_template";
+  });
+}
 var SENSITIVE_KEY = /password|passwd|pwd|secret|token|credential/i;
 function isSensitiveKey(key) {
   return SENSITIVE_KEY.test(key);
@@ -975,7 +990,7 @@ function buildOneMultiSeriesLineChart(rows, timeKey, valKey, columnLabelKey, ser
   if (seriesNames.length < 1 || seriesNames.length > 2) {
     return void 0;
   }
-  const sorted = sortRowsByTime(rows, timeKey).slice(-MAX_POINTS);
+  const sorted = sortRowsByTime(rows, timeKey);
   const timeSet = /* @__PURE__ */ new Set();
   for (const r of sorted) {
     const col = String(r[columnLabelKey] ?? "").trim();
@@ -1025,7 +1040,7 @@ function buildOneMultiSeriesLineChart(rows, timeKey, valKey, columnLabelKey, ser
   };
 }
 function buildMultiSeriesLineCharts(rows, timeKey, valKey, columnLabelKey, title) {
-  const sorted = sortRowsByTime(rows, timeKey).slice(-MAX_POINTS);
+  const sorted = sortRowsByTime(rows, timeKey);
   const seriesNames = [
     ...new Set(sorted.map((r) => String(r[columnLabelKey] ?? "").trim()).filter(Boolean))
   ].sort((a, b) => a.localeCompare(b));
@@ -1061,7 +1076,7 @@ function buildLineChartFromRows(rows, timeKey, valKey, title) {
       return buildMultiSeriesLineCharts(rows, timeKey, valKey, clk, title);
     }
   }
-  const sorted = sortRowsByTime(rows, timeKey).slice(-MAX_POINTS);
+  const sorted = sortRowsByTime(rows, timeKey);
   const map2 = /* @__PURE__ */ new Map();
   for (const r of sorted) {
     const t = labelForTime(r[timeKey]);
@@ -1188,7 +1203,7 @@ function tryBuildLatestGroupedBarCharts(latest, maxCharts, prefs) {
     if (!catKey || catKey === valKey) {
       return void 0;
     }
-    const slice = rows.slice(0, MAX_POINTS);
+    const slice = rows;
     const labels = slice.map((r) => String(r[catKey] ?? "").slice(0, 40));
     const values = slice.map((r) => parseNumber(r[valKey])).map((v) => v === void 0 ? 0 : v);
     if (!labels.some(Boolean)) {
@@ -1231,7 +1246,7 @@ function tryBuildLatestGroupedBarCharts(latest, maxCharts, prefs) {
         if (!catKey || catKey === valKey) {
           continue;
         }
-        const slice = groupRows.slice(0, MAX_POINTS);
+        const slice = groupRows;
         const labels = slice.map((r) => String(r[catKey] ?? "").slice(0, 40));
         const values = slice.map((r) => parseNumber(r[valKey])).map((v) => v === void 0 ? 0 : v);
         if (!labels.some(Boolean)) {
@@ -1480,9 +1495,7 @@ function mergeChartPrefsForLatestData(prefs, latest) {
   }
   return out;
 }
-function buildFetchDataChartsPayload(rawToolResult, userQuestion) {
-  const prefs = parseChartPreferencesFromQuestion(userQuestion ?? "");
-  const capCharts = Math.min(MAX_CHARTS, prefs.maxCharts ?? MAX_CHARTS);
+function buildFetchDataChartsPayload(rawToolResult, userQuestion, options) {
   const trimmed = rawToolResult.trim();
   if (!trimmed.startsWith("{")) {
     return void 0;
@@ -1496,6 +1509,9 @@ function buildFetchDataChartsPayload(rawToolResult, userQuestion) {
   if (root.ok !== true) {
     return void 0;
   }
+  const prefs = parseChartPreferencesFromQuestion(userQuestion ?? "");
+  const defaultCap = options?.chartCap ?? (isOracleHealthCheckToolResult(root) ? HEALTH_CHECK_MAX_CHARTS : MAX_CHARTS);
+  const capCharts = Math.min(defaultCap, prefs.maxCharts ?? defaultCap);
   if (root.multi_query === true && Array.isArray(root.sub_results)) {
     const subs = root.sub_results;
     const mergedCharts = [];
@@ -1514,7 +1530,9 @@ function buildFetchDataChartsPayload(rawToolResult, userQuestion) {
         intent: root.intent,
         routing: root.routing
       };
-      const subPayload = buildFetchDataChartsPayload(JSON.stringify(fakeRoot), subQ);
+      const subPayload = buildFetchDataChartsPayload(JSON.stringify(fakeRoot), subQ, {
+        chartCap: defaultCap
+      });
       const subCharts = subPayload?.charts ?? [];
       for (const c of subCharts) {
         if (mergedCharts.length >= capCharts) {
@@ -1607,7 +1625,7 @@ function buildFetchDataChartsPayload(rawToolResult, userQuestion) {
             charts.push(lineSpec);
           }
         } else {
-          const slice = latest.slice(0, MAX_POINTS);
+          const slice = latest;
           const labels = slice.map((r) => String(r[catKey] ?? "").slice(0, 40));
           const values = slice.map((r) => parseNumber(r[valKey])).map((v) => v === void 0 ? 0 : v);
           if (labels.some(Boolean)) {
@@ -1622,7 +1640,7 @@ function buildFetchDataChartsPayload(rawToolResult, userQuestion) {
           }
         }
       } else if (timeKey && valKey && !charts.some((c) => c.title.includes("latest_data"))) {
-        const sorted = sortRowsByTime(latest, timeKey).slice(-MAX_POINTS);
+        const sorted = sortRowsByTime(latest, timeKey);
         const labels = sorted.map((r) => labelForTime(r[timeKey]));
         const values = sorted.map((r) => parseNumber(r[valKey])).map((v) => v === void 0 ? 0 : v);
         if (labels.length) {
@@ -1639,7 +1657,7 @@ function buildFetchDataChartsPayload(rawToolResult, userQuestion) {
         const pair = findTwoNumericColumns(latest);
         if (pair) {
           const [k1, k2] = pair;
-          const pts = latest.slice(0, MAX_POINTS).map((r) => {
+          const pts = latest.map((r) => {
             const x = parseNumber(r[k1]);
             const y = parseNumber(r[k2]);
             if (x === void 0 || y === void 0) {
@@ -1682,6 +1700,147 @@ function finalizeCharts(charts, prefs, capCharts) {
   out = out.map((c) => lineChartWithAtMostThreePointsToTable(c));
   out = out.map((c) => applyChartTypePreference(c, prefs.chartType));
   return { charts: out.slice(0, capCharts) };
+}
+
+// src/utils/truncateOemToolResultForUi.ts
+var UI_MAX_DATA_ROWS = 20;
+var MARKER = "[structuredContent]";
+function extractPrimaryJsonFromMcpToolResult(raw) {
+  const t = raw.trim();
+  const idx = t.indexOf(MARKER);
+  const candidate = idx >= 0 ? t.slice(idx + MARKER.length).trim() : t;
+  if (!candidate.startsWith("{")) {
+    return null;
+  }
+  return candidate;
+}
+function truncateArray(arr, maxRows) {
+  if (!Array.isArray(arr) || arr.length <= maxRows) {
+    return arr ?? [];
+  }
+  return arr.slice(0, maxRows);
+}
+function truncateDataObject(data, maxRows) {
+  const d = data;
+  if (Array.isArray(d.latest_data) && d.latest_data.length > maxRows) {
+    d.latest_data = truncateArray(d.latest_data, maxRows);
+  }
+  if (Array.isArray(d.metric_time_series) && d.metric_time_series.length > maxRows) {
+    d.metric_time_series = truncateArray(d.metric_time_series, maxRows);
+  }
+  if (Array.isArray(d.incidents) && d.incidents.length > maxRows) {
+    d.incidents = truncateArray(d.incidents, maxRows);
+  }
+  if (Array.isArray(d.events) && d.events.length > maxRows) {
+    d.events = truncateArray(d.events, maxRows);
+  }
+}
+function truncateReportTextTables(text, maxRows) {
+  if (maxRows <= 0 || !text) {
+    return text;
+  }
+  const lines = text.split("\n");
+  const out = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    const m = line.match(/^查询结果（共 (\d+) 行）：\s*$/);
+    if (!m) {
+      out.push(line);
+      i++;
+      continue;
+    }
+    const total = parseInt(m[1], 10);
+    out.push(line);
+    i++;
+    if (i < lines.length && lines[i].trim() === "") {
+      out.push(lines[i]);
+      i++;
+    }
+    if (i >= lines.length || !lines[i].includes("|")) {
+      continue;
+    }
+    out.push(lines[i]);
+    i++;
+    if (i < lines.length && /^[\s|+:\-]+$/.test(lines[i])) {
+      out.push(lines[i]);
+      i++;
+    }
+    if (total <= maxRows) {
+      while (i < lines.length) {
+        const L = lines[i];
+        if (L.trim() === "" || L.startsWith("---") || L.startsWith("\u3010")) {
+          break;
+        }
+        if (/^查询结果（共 \d+ 行）：/.test(L)) {
+          break;
+        }
+        if (!L.includes("|")) {
+          break;
+        }
+        out.push(L);
+        i++;
+      }
+      continue;
+    }
+    let rowCount = 0;
+    while (i < lines.length) {
+      const L = lines[i];
+      if (L.trim() === "" || L.startsWith("---") || L.startsWith("\u3010")) {
+        break;
+      }
+      if (/^查询结果（共 \d+ 行）：/.test(L)) {
+        break;
+      }
+      if (!L.includes("|")) {
+        break;
+      }
+      if (rowCount < maxRows) {
+        out.push(L);
+        rowCount++;
+      }
+      i++;
+    }
+    out.push(`\u2026\uFF08\u5171 ${total} \u6761\uFF0C\u6B64\u5904\u4EC5\u663E\u793A\u524D ${maxRows} \u6761\uFF09`);
+  }
+  return out.join("\n");
+}
+function truncateFetchToolJsonObject(obj, maxRows) {
+  const clone2 = JSON.parse(JSON.stringify(obj));
+  if (clone2.data && typeof clone2.data === "object") {
+    truncateDataObject(clone2.data, maxRows);
+  }
+  if (Array.isArray(clone2.sub_results)) {
+    for (const sub of clone2.sub_results) {
+      const data = sub.data;
+      if (data && typeof data === "object") {
+        truncateDataObject(data, maxRows);
+      }
+    }
+  }
+  if (typeof clone2.report === "string") {
+    clone2.report = truncateReportTextTables(clone2.report, maxRows);
+  }
+  if (typeof clone2.result === "string") {
+    clone2.result = truncateReportTextTables(clone2.result, maxRows);
+  }
+  if (typeof clone2.result_summary === "string") {
+    clone2.result_summary = truncateReportTextTables(clone2.result_summary, maxRows);
+  }
+  return clone2;
+}
+function truncateOemToolResultStringForUi(raw, maxRows = UI_MAX_DATA_ROWS) {
+  const extracted = extractPrimaryJsonFromMcpToolResult(raw);
+  if (!extracted) {
+    return truncateReportTextTables(raw, maxRows);
+  }
+  try {
+    const obj = JSON.parse(extracted);
+    const truncated = truncateFetchToolJsonObject(obj, maxRows);
+    return JSON.stringify(truncated, null, 2);
+  } catch {
+    return truncateReportTextTables(raw, maxRows);
+  }
 }
 
 // src/orchestration/assistantOrchestrator.ts
@@ -1837,7 +1996,9 @@ var AssistantOrchestrator = class {
         });
         const toolResult = await this.mcp.callTool(toolName, resolvedArgs);
         const toolResultForLlm = this.prepareToolResultContentForLlm(toolResult);
-        const toolResultDisplay = this.redactSensitiveText(this.formatToolResultForExecutionTrace(toolResult));
+        const toolResultDisplay = this.redactSensitiveText(
+          this.formatToolResultForExecutionTrace(toolResult, UI_MAX_DATA_ROWS)
+        );
         const resultStep = {
           type: "tool-result",
           title: `Tool result: ${toolName}`,
@@ -2160,13 +2321,17 @@ var AssistantOrchestrator = class {
     return this.redactSensitiveText(raw);
   }
   /**
-   * Tool Execution Trace：始终优先展示完整 `report`（含【SQL 执行追踪】），不改为仅 llm_summary。
-   * 若无 `report` 则回退为格式化后的整段 JSON，避免 Trace 中丢失字段。
+   * Tool Execution Trace：优先展示 `report`（含【SQL 执行追踪】）；tabular 数据在展示侧最多 UI_MAX_DATA_ROWS 行。
+   * 图表仍用原始 MCP 返回由 buildFetchDataChartsPayload 解析。
    */
-  formatToolResultForExecutionTrace(raw) {
-    const trimmed = raw.trim();
+  /**
+   * Tool Execution Trace：优先 report；maxDataRows 仅影响正文展示（图表仍用原始 tool 返回）。
+   */
+  formatToolResultForExecutionTrace(raw, maxDataRows = UI_MAX_DATA_ROWS) {
+    const forUi = truncateOemToolResultStringForUi(raw, maxDataRows);
+    const trimmed = forUi.trim();
     if (!trimmed.startsWith("{")) {
-      return raw;
+      return forUi;
     }
     try {
       const obj = JSON.parse(trimmed);
@@ -2175,16 +2340,17 @@ var AssistantOrchestrator = class {
       }
       return JSON.stringify(obj, null, 2);
     } catch {
-      return raw;
+      return forUi;
     }
   }
   /**
    * 主回答区 / 链式最终正文：有 llm_summary 时优先短摘要；否则用 report。
    */
-  formatToolResultForDisplay(raw) {
-    const trimmed = raw.trim();
+  formatToolResultForDisplay(raw, maxDataRows = UI_MAX_DATA_ROWS) {
+    const forUi = truncateOemToolResultStringForUi(raw, maxDataRows);
+    const trimmed = forUi.trim();
     if (!trimmed.startsWith("{")) {
-      return raw;
+      return forUi;
     }
     try {
       const obj = JSON.parse(trimmed);
@@ -2198,8 +2364,9 @@ var AssistantOrchestrator = class {
         return obj.report.trim();
       }
     } catch {
+      return forUi;
     }
-    return raw;
+    return forUi;
   }
   redactSensitiveText(input) {
     let s = String(input ?? "");
@@ -20273,8 +20440,9 @@ function buildChatPanelHtml(options) {
       background: color-mix(in srgb, var(--vscode-list-hoverBackground) 80%, transparent);
     }
     .conv-item.active {
-      background: color-mix(in srgb, var(--vscode-list-activeSelectionBackground) 35%, transparent);
+      background: color-mix(in srgb, var(--vscode-list-activeSelectionBackground) 50%, transparent);
       border-color: var(--vscode-focusBorder);
+      box-shadow: inset 3px 0 0 var(--vscode-focusBorder);
     }
     .conv-title-text {
       flex: 1;
@@ -21188,7 +21356,10 @@ function buildChatPanelHtml(options) {
       }
       if (message.type === 'conversation-activate') {
         const p = message.payload;
-        if (p && p.activeId) currentActiveId = p.activeId;
+        if (p && p.activeId) {
+          currentActiveId = p.activeId;
+          renderConvList(convItems, p.activeId);
+        }
         if (p && p.messages) renderMessages(p.messages);
         return;
       }
@@ -21980,7 +22151,7 @@ function activate(context) {
       const result = await vscode8.window.withProgress(
         {
           location: vscode8.ProgressLocation.Notification,
-          title: "Running alert assistant..."
+          title: "Running OEM Assistant..."
         },
         async () => orchestrator.ask(userQuestion, ctx, {
           preferredTools: parsedPayload?.preferredTools ?? preferredTools,

@@ -106,6 +106,7 @@ def fetch_data_from_oem(
             {
                 "sub_question": s["sub_question"],
                 "generated_sql": s["generated_sql"],
+                "generated_sql_resolved": s.get("generated_sql_resolved"),
                 "sql_source": s["sql_source"],
                 "data": {
                     "latest_data": s["latest_data"],
@@ -125,6 +126,8 @@ def execute_omr_sql(
 ) -> dict[str, Any]:
     """
     在 OMR 资料库上执行前端传入的单条只读 SQL，返回结果结构与 fetch_data_from_oem 成功时一致（含 data、report、generated_sql）。
+
+    成功时 result 为与 fetch 相同的纯文本表格（不截断行数）；result_summary 为客观摘要；report 中含完整 SQL 追踪与【数据】表格。
 
     前置条件：config 中 data_source.mode 为 omr_db，且已配置 OMR 连接（omr_db / 环境变量）。
 

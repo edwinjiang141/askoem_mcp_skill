@@ -10,6 +10,9 @@ import httpx
 
 from src.auth_session import OemSession
 
+# REST 单次拉取条数上限：不在工具层做「默认只取几十条」的强截断（仍以 OEM 网关为准）。
+_OEM_REST_PAGE_MAX = 100_000
+
 
 @dataclass
 class OemDataBundle:
@@ -248,7 +251,7 @@ class OemClient:
         endpoints: dict[str, str],
         target_name: str,
         target_type_name: str = "host",
-        limit: int = 200,
+        limit: int = _OEM_REST_PAGE_MAX,
     ) -> list[dict[str, Any]]:
         target = self._resolve_target(
             session=session,
@@ -267,7 +270,7 @@ class OemClient:
                 session.oem_base_url,
                 endpoint,
                 auth=(session.username, session.password),
-                params={"limit": max(1, min(limit, 500))},
+                params={"limit": max(1, min(limit, _OEM_REST_PAGE_MAX))},
             )
             return _extract_items(payload)
         except RuntimeError as exc:
@@ -281,11 +284,11 @@ class OemClient:
         session: OemSession,
         endpoints: dict[str, str],
         target_type_name: str = "host",
-        limit: int = 50,
+        limit: int = _OEM_REST_PAGE_MAX,
     ) -> list[dict[str, Any]]:
         # 这里不走 page token 分页。部分 OEM 环境会对 page 参数返回 404。
         # MVP 阶段采用单次大页查询，优先保证稳定性。
-        safe_limit = max(1, min(limit, 200))
+        safe_limit = max(1, min(limit, _OEM_REST_PAGE_MAX))
         primary = self._query_targets(
             session=session,
             endpoints=endpoints,
@@ -314,7 +317,7 @@ class OemClient:
         self,
         session: OemSession,
         endpoints: dict[str, str],
-        limit: int = 50,
+        limit: int = _OEM_REST_PAGE_MAX,
     ) -> list[dict[str, str]]:
         hosts = self.list_targets(
             session=session,
