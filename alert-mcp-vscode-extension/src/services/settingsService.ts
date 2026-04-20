@@ -8,7 +8,7 @@ export class SettingsService {
       mcp: {
         serverUrl: config.get<string>('mcp.serverUrl', 'http://127.0.0.1:3000/sse'),
         connectionMode: config.get<'auto' | 'legacy-sse' | 'streamable-http'>('mcp.connectionMode', 'auto'),
-        requestTimeoutMs: config.get<number>('mcp.requestTimeoutMs', 60000)
+        requestTimeoutMs: config.get<number>('mcp.requestTimeoutMs', 180000)
       },
       llm: {
         provider: config.get<'openai-compatible' | 'copilot'>('llm.provider', 'openai-compatible'),

@@ -4,6 +4,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -11,7 +12,7 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 
 def parse_explicit_row_limit(question: str) -> Optional[int]:
@@ -767,11 +768,11 @@ class OemNl2SqlEngine:
                 pass
             else:
                 return _finalize_template_sql(
-                    "SELECT target_name, target_type, display_name, host_name, last_load_time_utc "
+                "SELECT target_name, target_type, display_name, host_name, last_load_time_utc "
                     "FROM ( SELECT target_name, target_type, display_name, host_name, last_load_time_utc "
                     "FROM mgmt$target ORDER BY last_load_time_utc DESC NULLS LAST )",
                     normalized,
-                )
+            )
 
         if any(k in q for k in ["监控项", "监控指标", "metric", "metrics"]) and any(
             k in q for k in ["查看", "列出", "有哪些", "清单", "列表"]
@@ -963,6 +964,73 @@ class OemNl2SqlEngine:
             )
         return True, ""
 
+    MAX_SKILL_SQL_STATEMENTS = 25
+
+    @staticmethod
+    def _split_skill_sql_statements(sql: str) -> list[str]:
+        """按分号拆成多条；去掉首尾空白；丢弃空段。不含 PL/SQL 块内分号识别。"""
+        out: list[str] = []
+        for chunk in (sql or "").split(";"):
+            t = chunk.strip()
+            if t:
+                out.append(t)
+        return out
+
+    @staticmethod
+    def _is_safe_sql_for_skill_statement(stmt: str) -> tuple[bool, str]:
+        """
+        单条 Skill SQL 片段（不得再含分号；由 _split_skill_sql_statements 保证）。
+        不校验 ALLOWED_VIEWS；禁止 DML/DDL；保留 WARNING_THRESHOLD 数字比较规则。
+        """
+        s = stmt.strip().lower()
+        if ";" in s:
+            return False, "片段内仍含分号"
+        if not (
+            s.startswith("select")
+            or s.startswith("with")
+            or s.startswith("explain")
+        ):
+            return False, "Skill SQL 仅允许 SELECT / WITH / EXPLAIN"
+        for bad in [
+            " insert ",
+            " update ",
+            " delete ",
+            " merge ",
+            " drop ",
+            " alter ",
+            " truncate ",
+            " create ",
+        ]:
+            if bad in f" {s} ":
+                return False, f"SQL 包含禁止的关键词: {bad.strip()}"
+        if OemNl2SqlEngine._has_unsafe_varchar_numeric_compare(stmt):
+            return (
+                False,
+                "禁止对 VARCHAR 型 WARNING_THRESHOLD/CRITICAL_THRESHOLD 直接写与数字的 >、<、=、BETWEEN；"
+                "须 TO_NUMBER(TRIM(列))，否则 ORA-01722",
+            )
+        return True, ""
+
+    @staticmethod
+    def _is_safe_sql_for_skill(sql: str) -> tuple[bool, str]:
+        """
+        Skill 工作流专用：允许用分号分隔的多条只读语句（顺序执行由 execute_skill_omr_sql 负责）。
+        每条片段单独通过 _is_safe_sql_for_skill_statement；条数有上限。
+        """
+        stmts = OemNl2SqlEngine._split_skill_sql_statements(sql)
+        if not stmts:
+            return False, "SQL 为空或无有效语句"
+        if len(stmts) > OemNl2SqlEngine.MAX_SKILL_SQL_STATEMENTS:
+            return (
+                False,
+                f"Skill SQL 语句数超过上限 ({OemNl2SqlEngine.MAX_SKILL_SQL_STATEMENTS})",
+            )
+        for i, stmt in enumerate(stmts, start=1):
+            ok, reason = OemNl2SqlEngine._is_safe_sql_for_skill_statement(stmt)
+            if not ok:
+                return False, f"第 {i} 条语句: {reason}"
+        return True, ""
+
     @staticmethod
     def _strip_llm_trailing_rownum_without_user_limit(sql: str, question: str) -> str:
         """用户未要求条数时去掉 LLM 在末尾自动加的 WHERE ROWNUM <= N，并补内联视图别名 q。"""
@@ -995,7 +1063,6 @@ class OemNl2SqlEngine:
             if safe:
                 return SqlPlan(sql=template, source="template")
             self.last_rejection = SqlRejection(sql=template, reason=f"模板 SQL 安全检查失败: {reason}")
-
         return None
 
     def _try_llm(self, question: str) -> Optional[SqlPlan]:

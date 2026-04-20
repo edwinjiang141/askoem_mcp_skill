@@ -17,6 +17,8 @@ export class McpClientService {
   private connectedUrl: string | undefined;
   private toolsCache: Tool[] = [];
   private instructions = '';
+  /** MCP SDK 单次请求默认 60s；须与 settings.mcp.requestTimeoutMs 一致，否则 run_skill 等长任务会先超时。 */
+  private toolRequestTimeoutMs = 180000;
 
   constructor(
     private readonly output: vscode.OutputChannel,
@@ -42,13 +44,16 @@ export class McpClientService {
   async connect(settings: ExtensionSettings): Promise<void> {
     await this.disconnect();
 
+    this.toolRequestTimeoutMs = Math.max(5000, settings.mcp.requestTimeoutMs);
     const url = new URL(settings.mcp.serverUrl);
     const token = await this.secrets.getMcpBearerToken();
     const authProvider: AuthProvider | undefined = token
       ? { token: async () => token }
       : undefined;
 
-    this.output.appendLine(`[MCP] connecting to ${url.toString()} mode=${settings.mcp.connectionMode}`);
+    this.output.appendLine(
+      `[MCP] connecting to ${url.toString()} mode=${settings.mcp.connectionMode} toolTimeoutMs=${this.toolRequestTimeoutMs}`
+    );
 
     const createClient = () =>
       new Client({
@@ -113,7 +118,13 @@ export class McpClientService {
       throw new Error('MCP client is not connected.');
     }
 
-    const response = await this.client.callTool({ name, arguments: args });
+    this.output.appendLine(
+      `[MCP] callTool name=${name} timeoutMs=${this.toolRequestTimeoutMs}`
+    );
+    const response = await this.client.callTool(
+      { name, arguments: args },
+      { timeout: this.toolRequestTimeoutMs }
+    );
 
     const textParts = response.content
       .map((item: any) => {
@@ -160,5 +171,6 @@ export class McpClientService {
     this.connectedUrl = undefined;
     this.instructions = '';
     this.toolsCache = [];
+    this.toolRequestTimeoutMs = 180000;
   }
 }

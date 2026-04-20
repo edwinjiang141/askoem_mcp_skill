@@ -121,9 +121,9 @@
         },
         "alertMcp.mcp.requestTimeoutMs": {
           "type": "number",
-          "default": 60000,
+          "default": 180000,
           "minimum": 5000,
-          "description": "Timeout in milliseconds for MCP tool calls."
+          "description": "Single MCP tool call timeout (ms). run_skill workflow often exceeds 60s; 180000+ recommended. Passed to @modelcontextprotocol/client callTool()."
         },
         "alertMcp.llm.provider": {
           "type": "string",

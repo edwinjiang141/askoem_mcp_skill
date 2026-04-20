@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import logging
 import re
 import os
 from typing import Any, Optional
+
+_log_svc = logging.getLogger("askoem.service")
 
 from src.auth_session import OemSession, SessionCache
 from src.alert_router import classify_alert_scenario
@@ -23,6 +26,7 @@ from src.oracle_health_check import (
 )
 from src.oracle_health_tools import run_health_analysis_tools
 from src.skill_engine import AgentSkillsEngine
+from src.skill_workflow import run_skill_workflow_pipeline
 
 
 def _sub_query_sql_for_trace(sub: dict[str, Any]) -> str:
@@ -179,6 +183,124 @@ class AskOpsService:
     # AI 诊断入口（供 run_skill MCP tool 调用）
     # ------------------------------------------------------------------
 
+    def _empty_fetch_for_skill(
+        self,
+        session_id: Optional[str],
+        oem_base_url: Optional[str],
+        username: Optional[str],
+        password: Optional[str],
+    ) -> FetchDataResult:
+        """
+        run_skill 在已选定 Skill 时跳过 NL2SQL，避免 trace 中出现无关的 mgmt$metric_current 等查询。
+        REST 模式下仍解析 OEM 会话以便回显 session_id。
+        """
+        sid = session_id
+        oem_errors: list[str] = []
+        if self._config.data_source_mode != "omr_db":
+            try:
+                session = self._resolve_session(
+                    session_id=session_id,
+                    oem_base_url=oem_base_url,
+                    username=username,
+                    password=password,
+                )
+                sid = session.session_id
+            except (ValueError, RuntimeError) as e:
+                oem_errors.append(str(e))
+        return FetchDataResult(
+            session_id=sid,
+            need_follow_up=False,
+            follow_up_question=None,
+            intent_type=INTENT_SINGLE_DIAGNOSIS,
+            target_name=None,
+            target_type_name=None,
+            time_range=None,
+            metric_keys=[],
+            route_key=None,
+            scenario=None,
+            classifier="skill_skip_fetch",
+            confidence=None,
+            latest_data=[],
+            metric_time_series=[],
+            incidents=[],
+            events=[],
+            oem_errors=oem_errors,
+            generated_sql=None,
+            sql_source="skill_skip_fetch",
+            omr_sub_queries=None,
+            forced_skill_name=None,
+        )
+
+    def _build_run_skill_context_flat(self, fetched: FetchDataResult) -> dict[str, Any]:
+        """供显式 skill / workflow 使用的 OEM 上下文（非健康检查脚本路径）。"""
+        return {
+            "target_name": fetched.target_name,
+            "scenario": fetched.scenario,
+            "time_range": fetched.time_range,
+            "incidents": fetched.incidents,
+            "events": fetched.events,
+            "latest_data": fetched.latest_data,
+            "metric_time_series": fetched.metric_time_series,
+            "oem_errors": fetched.oem_errors,
+            "need_follow_up": fetched.need_follow_up,
+            "follow_up_question": fetched.follow_up_question,
+            "fetch_notes": fetched.follow_up_question if fetched.need_follow_up else None,
+            "generated_sql": fetched.generated_sql,
+            "sql_source": fetched.sql_source,
+        }
+
+    def _run_skill_workflow_or_executor(
+        self,
+        question: str,
+        fetched: FetchDataResult,
+        resolved_skill_name: str,
+    ) -> dict[str, Any]:
+        """已锁定 Skill 名称：workflow（omr_db+LLM）或单次 SkillExecutor。"""
+        context = self._build_run_skill_context_flat(fetched)
+        result_text: str
+        resolved_skill: Optional[str] = resolved_skill_name
+        if self._config.data_source_mode == "omr_db" and self._skill_engine.enabled:
+            try:
+                omr_ok = self._omr_client is not None
+                result_text, resolved_skill = run_skill_workflow_pipeline(
+                    self._skill_engine.registry,
+                    resolved_skill_name,
+                    question,
+                    context,
+                    lambda sql: self.execute_skill_omr_sql(sql, fetched.session_id),
+                    omr_ok,
+                )
+            except Exception:
+                result_text, resolved_skill = self._skill_engine.process(
+                    question,
+                    context,
+                    forced_skill_name=resolved_skill_name,
+                )
+        else:
+            result_text, resolved_skill = self._skill_engine.process(
+                question,
+                context,
+                forced_skill_name=resolved_skill_name,
+            )
+        if resolved_skill is None:
+            result_text = self._build_fallback_summary(fetched)
+        return self._finalize_run_skill_result(
+            {
+                "ok": True,
+                "session_id": fetched.session_id,
+                "need_follow_up": False,
+                "follow_up_question": None,
+                "skill_name": resolved_skill,
+                "result": result_text,
+                "oem_errors": fetched.oem_errors,
+                "generated_sql": fetched.generated_sql,
+                "sql_source": fetched.sql_source,
+                "omr_sub_queries": fetched.omr_sub_queries,
+            },
+            question,
+            fetched,
+        )
+
     def run_skill_with_llm(
         self,
         question: str,
@@ -192,22 +314,184 @@ class AskOpsService:
         AI 诊断统一入口。
 
         流程：
-        1. 调用 fetch_data() 获取 OEM 结构化数据
-        2. 将 OEM 数据作为 context 交给 AgentSkillsEngine（LLM 路由 + LLM 执行）
-        3. 返回结构化结果字典
+        1. 注册 Skill；显式 skill_name 或 SkillRouter 先解析目标 Skill
+        2. 若已命中注册表中的 Skill：跳过 NL2SQL 预取数（避免无关 mgmt$metric_current），直接 workflow
+        3. 健康检查类问题仍走 fetch_data 模板 + 脚本工具
+        4. 否则 fetch_data → builtin / 路由 Skill
 
         输入: question + 认证参数（session_id 或 oem_base_url/username/password）
         输出: { ok, session_id, need_follow_up, follow_up_question, skill_name, result }
         降级: LLM 不可用时回退到简单文本摘要
         """
-        # 步骤 1: 数据层取数（捕获认证异常，避免冒泡导致 Cline 误判为前置条件失败）
+        self._skill_engine.reload_registry()
+        explicit_in = (skill_name or "").strip()
+
+        if explicit_in:
+            if explicit_in not in self._skill_engine.registry.skills:
+                return self._finalize_run_skill_result(
+                    {
+                        "ok": False,
+                        "session_id": session_id,
+                        "need_follow_up": False,
+                        "follow_up_question": None,
+                        "skill_name": None,
+                        "result": (
+                            f"Skill '{explicit_in}' 未找到。请确认 skills 目录存在该 SKILL.md，"
+                            "或设置环境变量 ASKOEM_SKILLS_DIR；也可调用 reload_skills 后重试。"
+                        ),
+                        "oem_errors": [],
+                        "generated_sql": None,
+                        "sql_source": None,
+                    },
+                    question,
+                    None,
+                )
+
+        routed: Optional[str] = None
+        if not explicit_in and self._skill_engine.enabled and self._skill_engine.router:
+            routed = self._skill_engine.router.route(question)
+
+        resolved_skill = explicit_in or routed
+        _log_svc.info(
+            "run_skill_with_llm resolve explicit=%r routed=%r resolved=%r",
+            explicit_in or None,
+            routed,
+            resolved_skill,
+        )
+
+        health_gate = is_health_check_question(question) and (
+            not explicit_in or explicit_in == ORACLE_HEALTH_CHECK_SKILL_NAME
+        )
+        fetched_prefetch: FetchDataResult | None = None
+        if health_gate:
+            try:
+                fetched_prefetch = self.fetch_data(
+                    question=question,
+                    session_id=session_id,
+                    oem_base_url=oem_base_url,
+                    username=username,
+                    password=password,
+                )
+            except (ValueError, RuntimeError) as e:
+                return self._finalize_run_skill_result(
+                    {
+                        "ok": False,
+                        "session_id": session_id,
+                        "need_follow_up": False,
+                        "follow_up_question": None,
+                        "skill_name": None,
+                        "result": str(e),
+                        "oem_errors": [],
+                        "generated_sql": None,
+                        "sql_source": None,
+                    },
+                    question,
+                    None,
+                )
+            if _is_health_check_fetch_result(fetched_prefetch):
+                fetched = fetched_prefetch
+                if fetched.need_follow_up:
+                    return self._finalize_run_skill_result(
+                        {
+                            "ok": False,
+                            "session_id": fetched.session_id,
+                            "need_follow_up": True,
+                            "follow_up_question": fetched.follow_up_question,
+                            "skill_name": None,
+                            "result": fetched.follow_up_question,
+                            "oem_errors": fetched.oem_errors,
+                            "generated_sql": fetched.generated_sql,
+                            "sql_source": fetched.sql_source,
+                            "omr_sub_queries": fetched.omr_sub_queries,
+                        },
+                        question,
+                        fetched,
+                    )
+                if (
+                    fetched.forced_skill_name == ORACLE_HEALTH_CHECK_SKILL_NAME
+                    and fetched.omr_sub_queries
+                ):
+                    tool_payload = run_health_analysis_tools(
+                        fetched.omr_sub_queries,
+                        self._config.default_base_url,
+                    )
+                    context = {
+                        "target_name": fetched.target_name,
+                        "scenario": fetched.scenario,
+                        "time_range": fetched.time_range,
+                        "health_tool_results": tool_payload,
+                        "oem_console_deep_link": tool_payload.get("oem_console_entry_url", ""),
+                        "oem_errors": fetched.oem_errors,
+                        "latest_data": [],
+                        "metric_time_series": [],
+                        "incidents": [],
+                        "events": [],
+                    }
+                else:
+                    context = {
+                        "target_name": fetched.target_name,
+                        "scenario": fetched.scenario,
+                        "time_range": fetched.time_range,
+                        "incidents": fetched.incidents,
+                        "events": fetched.events,
+                        "latest_data": fetched.latest_data,
+                        "metric_time_series": fetched.metric_time_series,
+                        "oem_errors": fetched.oem_errors,
+                    }
+                forced = (
+                    (skill_name or "").strip() or (fetched.forced_skill_name or "")
+                ).strip() or None
+                result_text, resolved_skill = self._skill_engine.process(
+                    question,
+                    context,
+                    forced_skill_name=forced,
+                )
+                if resolved_skill is None:
+                    result_text = self._build_fallback_summary(fetched)
+                return self._finalize_run_skill_result(
+                    {
+                        "ok": True,
+                        "session_id": fetched.session_id,
+                        "need_follow_up": False,
+                        "follow_up_question": None,
+                        "skill_name": resolved_skill,
+                        "result": result_text,
+                        "oem_errors": fetched.oem_errors,
+                        "generated_sql": fetched.generated_sql,
+                        "sql_source": fetched.sql_source,
+                        "omr_sub_queries": fetched.omr_sub_queries,
+                    },
+                    question,
+                    fetched,
+                )
+
+        if (
+            resolved_skill
+            and resolved_skill in self._skill_engine.registry.skills
+        ):
+            fetched = self._empty_fetch_for_skill(
+                session_id, oem_base_url, username, password
+            )
+            _log_svc.info(
+                "run_skill_with_llm enter_workflow skill=%s data_source_mode=%s",
+                resolved_skill,
+                self._config.data_source_mode,
+            )
+            return self._run_skill_workflow_or_executor(
+                question, fetched, resolved_skill
+            )
+
         try:
-            fetched = self.fetch_data(
-                question=question,
-                session_id=session_id,
-                oem_base_url=oem_base_url,
-                username=username,
-                password=password,
+            fetched = (
+                fetched_prefetch
+                if fetched_prefetch is not None
+                else self.fetch_data(
+                    question=question,
+                    session_id=session_id,
+                    oem_base_url=oem_base_url,
+                    username=username,
+                    password=password,
+                )
             )
         except (ValueError, RuntimeError) as e:
             return self._finalize_run_skill_result(
@@ -245,11 +529,7 @@ class AskOpsService:
             )
 
         # 非诊断类问题（如目标清单/监控项清单）直接返回结构化数据结果，避免无意义进入 Skill 路由。
-        # 健康检查取数（模板 SQL + forced_skill）必须进入 oracle-db-quick-health，不得标成 builtin_query_reply。
-        if (
-            not _is_health_check_fetch_result(fetched)
-            and fetched.intent_type in {INTENT_TARGET_LIST, INTENT_METRIC_LIST}
-        ):
+        if fetched.intent_type in {INTENT_TARGET_LIST, INTENT_METRIC_LIST}:
             return self._finalize_run_skill_result(
                 {
                     "ok": True,
@@ -269,8 +549,7 @@ class AskOpsService:
 
         # omr_db 通用数据查询：有数据行且不是诊断类意图 → 直接格式化为文本表格返回
         if (
-            not _is_health_check_fetch_result(fetched)
-            and self._config.data_source_mode == "omr_db"
+            self._config.data_source_mode == "omr_db"
             and fetched.latest_data
             and fetched.intent_type not in {INTENT_SINGLE_DIAGNOSIS, INTENT_TARGET_LIST, INTENT_METRIC_LIST}
         ):
@@ -291,48 +570,25 @@ class AskOpsService:
                 fetched,
             )
 
-        # 步骤 2: 组装 context。Oracle 快速健康检查：先跑脚本工具，LLM 只消费 health_tool_results，不注入原始行。
-        if (
-            fetched.forced_skill_name == ORACLE_HEALTH_CHECK_SKILL_NAME
-            and fetched.omr_sub_queries
-        ):
-            tool_payload = run_health_analysis_tools(
-                fetched.omr_sub_queries,
-                self._config.default_base_url,
-            )
-            context: dict[str, Any] = {
-                "target_name": fetched.target_name,
-                "scenario": fetched.scenario,
-                "time_range": fetched.time_range,
-                "health_tool_results": tool_payload,
-                "oem_console_deep_link": tool_payload.get("oem_console_entry_url", ""),
-                "oem_errors": fetched.oem_errors,
-                "latest_data": [],
-                "metric_time_series": [],
-                "incidents": [],
-                "events": [],
-            }
-        else:
-            context = {
-                "target_name": fetched.target_name,
-                "scenario": fetched.scenario,
-                "time_range": fetched.time_range,
-                "incidents": fetched.incidents,
-                "events": fetched.events,
-                "latest_data": fetched.latest_data,
-                "metric_time_series": fetched.metric_time_series,
-                "oem_errors": fetched.oem_errors,
-            }
+        # 默认：组装 context + 路由 Skill
+        context = {
+            "target_name": fetched.target_name,
+            "scenario": fetched.scenario,
+            "time_range": fetched.time_range,
+            "incidents": fetched.incidents,
+            "events": fetched.events,
+            "latest_data": fetched.latest_data,
+            "metric_time_series": fetched.metric_time_series,
+            "oem_errors": fetched.oem_errors,
+        }
 
-        # 步骤 3: 调用 AI Skill Engine（SkillRouter 选 Skill -> SkillExecutor 生成诊断）
-        forced = ((skill_name or "").strip() or (fetched.forced_skill_name or "")).strip() or None
+        forced = ((fetched.forced_skill_name or "")).strip() or None
         result_text, resolved_skill = self._skill_engine.process(
             question,
             context,
             forced_skill_name=forced,
         )
 
-        # 步骤 4: 未命中 Skill 时降级
         if resolved_skill is None:
             result_text = self._build_fallback_summary(fetched)
 
@@ -923,6 +1179,161 @@ class AskOpsService:
             "report": report,
             "result_summary": rs,
             # 主应答区展示表格：若填 llm_summary，扩展会优先显示摘要而非表格
+            "llm_summary": "",
+            "result": table_text,
+        }
+
+    def execute_skill_omr_sql(self, sql: str, session_id: Optional[str] = None) -> dict[str, Any]:
+        """
+        仅供 Skill 工作流 / run_skill 内部使用：与 execute_omr_sql 相同的返回结构，
+        但安全检查使用 _is_safe_sql_for_skill（不限制 OEM 管理视图白名单）。
+
+        输入: sql（一条或多条 SELECT/WITH/EXPLAIN，用分号分隔；按顺序逐条执行），session_id（可选，仅回显）
+        输出: 与 execute_omr_sql 成功/失败时字段一致；routing.classifier 为 execute_skill_omr_sql
+        """
+        sql_stripped = (sql or "").strip()
+        if not sql_stripped:
+            return {
+                "ok": False,
+                "session_id": session_id,
+                "generated_sql": None,
+                "sql_source": "skill_sql",
+                "result": "SQL 不能为空。",
+                "report": "=== execute_skill_omr_sql 执行报告 ===\n\n【错误】\nSQL 不能为空。\n",
+            }
+
+        if self._config.data_source_mode != "omr_db":
+            return {
+                "ok": False,
+                "session_id": session_id,
+                "generated_sql": sql_stripped,
+                "sql_source": "skill_sql",
+                "result": "仅当 config 中 data_source.mode 为 omr_db 时支持本路径。",
+                "report": (
+                    "=== execute_skill_omr_sql 执行报告 ===\n\n【SQL】\n"
+                    f"{sql_stripped}\n\n【错误】\n当前数据源不是 omr_db。\n"
+                ),
+            }
+
+        if not self._omr_client:
+            self._omr_client = self._build_omr_client(self._config)
+        if not self._omr_client:
+            return {
+                "ok": False,
+                "session_id": session_id,
+                "generated_sql": sql_stripped,
+                "sql_source": "skill_sql",
+                "result": "未配置 OMR 数据库连接（username/password/dsn）。",
+                "report": (
+                    "=== execute_skill_omr_sql 执行报告 ===\n\n【SQL】\n"
+                    f"{sql_stripped}\n\n【错误】\n未配置 OMR 连接。\n"
+                ),
+            }
+
+        safe, reason = OemNl2SqlEngine._is_safe_sql_for_skill(sql_stripped)
+        if not safe:
+            return {
+                "ok": False,
+                "session_id": session_id,
+                "generated_sql": sql_stripped,
+                "sql_source": "skill_sql",
+                "result": f"Skill SQL 安全检查未通过: {reason}",
+                "report": (
+                    "=== execute_skill_omr_sql 执行报告 ===\n\n【SQL】\n"
+                    f"{sql_stripped}\n\n【错误】\n{reason}\n"
+                ),
+            }
+
+        stmts = OemNl2SqlEngine._split_skill_sql_statements(sql_stripped)
+        all_rows: list[dict[str, Any]] = []
+        table_sections: list[str] = []
+        for idx, stmt in enumerate(stmts, start=1):
+            try:
+                rows = self._omr_client.execute_sql(stmt)
+            except Exception as e:
+                return {
+                    "ok": False,
+                    "session_id": session_id,
+                    "generated_sql": sql_stripped,
+                    "sql_source": "skill_sql",
+                    "result": f"第 {idx}/{len(stmts)} 条语句执行失败: {e}",
+                    "report": (
+                        "=== execute_skill_omr_sql 执行报告 ===\n\n【SQL】\n"
+                        f"{sql_stripped}\n\n【错误】\n第 {idx}/{len(stmts)} 条:\n{stmt}\n{e}\n"
+                    ),
+                }
+            for r in rows:
+                row = dict(r)
+                if len(stmts) > 1:
+                    row["_skill_statement_index"] = idx
+                all_rows.append(row)
+            tbl = self._build_sql_result_table_text(rows)
+            if len(stmts) > 1:
+                table_sections.append(f"--- 语句 {idx}/{len(stmts)} ---\n{tbl}")
+            else:
+                table_sections.append(tbl)
+        table_text = "\n\n".join(table_sections)
+        rows = all_rows
+
+        oem_errors: list[str] = []
+        fetched = FetchDataResult(
+            session_id=session_id,
+            need_follow_up=False,
+            follow_up_question=None,
+            intent_type=None,
+            target_name=None,
+            target_type_name=None,
+            time_range=None,
+            metric_keys=[],
+            route_key=None,
+            scenario=None,
+            classifier="execute_skill_omr_sql",
+            confidence=None,
+            latest_data=rows,
+            metric_time_series=[],
+            incidents=[],
+            events=[],
+            oem_errors=oem_errors,
+            generated_sql=sql_stripped,
+            sql_source="skill_sql",
+        )
+        report = self.build_fetch_tool_report(fetched, sql_stripped)
+        report = report.replace(
+            "=== fetch_data_from_oem 执行报告 ===",
+            "=== execute_skill_omr_sql 执行报告 ===",
+            1,
+        )
+        rs = self.build_fetch_data_fact_summary(fetched)
+        table_text = self._build_sql_result_table_text(rows)
+        if oem_errors:
+            table_text = "\n".join(oem_errors) + "\n\n" + table_text
+
+        return {
+            "ok": True,
+            "session_id": session_id,
+            "generated_sql": sql_stripped,
+            "sql_source": "skill_sql",
+            "intent": {
+                "intent_type": None,
+                "target_name": None,
+                "target_type_name": None,
+                "time_range": None,
+                "metric_keys": [],
+                "route_key": None,
+            },
+            "routing": {
+                "scenario": None,
+                "classifier": "execute_skill_omr_sql",
+                "confidence": None,
+            },
+            "data": {
+                "latest_data": rows,
+                "metric_time_series": [],
+                "incidents": [],
+                "events": [],
+            },
+            "report": report,
+            "result_summary": rs,
             "llm_summary": "",
             "result": table_text,
         }

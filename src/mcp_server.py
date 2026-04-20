@@ -1,15 +1,35 @@
 from __future__ import annotations
 
+import logging
+import os
 import sys
+import time
+from pathlib import Path
 from typing import Any
 
+from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+
+# MCP 进程 cwd 往往不是仓库根；显式加载项目根 .env，否则 DEEPSEEK_API_KEY 读不到。
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(_REPO_ROOT / ".env")
+
+from src.mcp_logging import setup_mcp_logging
+
+MCP_LOG_PATH = setup_mcp_logging(_REPO_ROOT)
+_log_mcp = logging.getLogger("askoem.mcp")
+_log_mcp.info(
+    "ai-gateway-mvp starting log_file=%s cwd=%s",
+    MCP_LOG_PATH,
+    os.getcwd(),
+)
 
 from src.metric_config import load_metric_config
 from src.service import AskOpsService
+from src.skill_engine import resolve_skills_dir
 
 
-CONFIG_PATH = "config/metric_map.yaml"
+CONFIG_PATH = str(_REPO_ROOT / "config" / "metric_map.yaml")
 SERVER_VERSION = "0.2.0"
 
 config = load_metric_config(CONFIG_PATH)
@@ -142,6 +162,23 @@ def execute_omr_sql(
 
 
 @mcp.tool()
+def execute_skill_omr_sql(
+    sql: str | None = None,
+    query: str | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """
+    在 OMR 上执行 Skill 工作流中的只读 SQL（与 execute_omr_sql 分离，不复用其白名单）。
+
+    用途：SKILL.md 中的 gv$session / v$lock 等诊断 SQL；禁止 DML；多条只读语句可用分号分隔，按顺序执行。
+    参数：sql 与 query 二选一（优先 sql）。
+    前置：data_source.mode 为 omr_db 且已配置 OMR 连接。
+    """
+    sql_text = (sql or query or "").strip()
+    return service.execute_skill_omr_sql(sql=sql_text, session_id=session_id)
+
+
+@mcp.tool()
 def run_skill(
     question: str,
     session_id: str | None = None,
@@ -158,22 +195,100 @@ def run_skill(
     - rest 模式：传入 session_id（由 oem_api_login 返回），或传入 oem_base_url + username + password
 
     执行流程：
-    1) 根据 data_source_mode 获取数据（omr_db 走 NL2SQL 直连数据库 / rest 走 OEM REST API）
-    2) 通过 AI Skill Engine（SkillRouter + SkillExecutor）生成诊断
-    3) 返回 LLM 生成的结构化诊断文本（结论/证据/SOP建议/下一步）
+    1) 加载 skills；若传入 skill_name 或未传则由 SkillRouter 根据问题匹配 Skill
+    2) 若已命中注册表中的 Skill：不再先做 NL2SQL 指标查询（避免 trace 中无关 mgmt$metric_current），
+       直接按 SKILL.md 工作流执行；只读 SQL 走 execute_skill_omr_sql（视图白名单较 execute_omr_sql 更宽）
+    3) 健康检查类问题仍先 fetch_data 模板取数，再走健康 Skill
+    4) 其余情况：fetch_data → 必要时 builtin 表格回复或 Skill 诊断
 
-    可选参数 skill_name：若传入且在注册表中存在，跳过 Skill 路由器直接使用该 Skill（调试或显式指定）。
+    可选参数 skill_name：显式指定 Skill 名称（须与 SKILL.md frontmatter 的 name 一致）。
 
     降级行为：若 DEEPSEEK_API_KEY 未配置或 LLM 调用失败，返回简单文本摘要。
+
+    诊断：详见仓库 logs/mcp_server.log 与进程 stderr；health_check 返回 log_file 绝对路径。
+
+    耗时与界面超时：workflow 含「规划 LLM + 只读 SQL + 汇总 LLM」，总耗时常达 60–120 秒。
+    VS Code 扩展 OEM Assistant：设置项 alertMcp.mcp.requestTimeoutMs（毫秒）传给 MCP SDK 的 callTool；
+    旧版扩展未传该值时 SDK 默认 60000ms，短于总耗时则界面先报 Request timed out，服务端仍可能跑完。
+    处理：将该设置调到 180000 以上并重连 MCP；其它 MCP 宿主同理调大单次工具超时。
     """
-    return service.run_skill_with_llm(
-        question=question,
-        session_id=session_id,
-        oem_base_url=oem_base_url,
-        username=username,
-        password=password,
-        skill_name=skill_name,
+    t0 = time.perf_counter()
+    qprev = (question or "")[:400].replace("\n", " ")
+    _log_mcp.info(
+        "run_skill tool invoke skill_name=%r question_preview=%r",
+        skill_name,
+        qprev,
     )
+    try:
+        out = service.run_skill_with_llm(
+            question=question,
+            session_id=session_id,
+            oem_base_url=oem_base_url,
+            username=username,
+            password=password,
+            skill_name=skill_name,
+        )
+        elapsed = time.perf_counter() - t0
+        _log_mcp.info(
+            "run_skill tool done in %.2fs ok=%s skill_name=%s",
+            elapsed,
+            out.get("ok"),
+            out.get("skill_name"),
+        )
+        if elapsed >= 55.0:
+            _log_mcp.warning(
+                "run_skill 总耗时 %.1fs ≥55s：若 MCP 客户端 callTool 默认 60s，界面会先超时；"
+                "本条仍表示服务端已返回。VS Code：alertMcp.mcp.requestTimeoutMs≥180000。",
+                elapsed,
+            )
+        return out
+    except Exception:
+        _log_mcp.exception("run_skill tool failed after %.2fs", time.perf_counter() - t0)
+        raise
+
+
+@mcp.tool()
+def list_skills() -> dict[str, Any]:
+    """
+    列出当前已加载的 Skill（来自 skills 目录下各 SKILL.md 的 frontmatter）。
+
+    输入：无。
+    输出：skills_dir 解析路径、skills[{name, description}]。
+    """
+    reg = service._skill_engine.registry
+    items = [
+        {"name": m.name, "description": m.description}
+        for m in reg.skills.values()
+    ]
+    items.sort(key=lambda x: x["name"])
+    return {
+        "ok": True,
+        "skills_dir": str(resolve_skills_dir()),
+        "skills": items,
+    }
+
+
+@mcp.tool()
+def reload_skills() -> dict[str, Any]:
+    """
+    重新扫描 skills 目录并注册 SKILL.md（拷贝新 skill 后可调用，无需重启进程）。
+
+    输入：无。
+    输出：与 list_skills 相同结构。
+    """
+    service._skill_engine.reload_registry()
+    reg = service._skill_engine.registry
+    items = [
+        {"name": m.name, "description": m.description}
+        for m in reg.skills.values()
+    ]
+    items.sort(key=lambda x: x["name"])
+    return {
+        "ok": True,
+        "skills_dir": str(resolve_skills_dir()),
+        "skills": items,
+        "message": "已重新加载 skills 目录。",
+    }
 
 
 @mcp.tool()
@@ -188,12 +303,26 @@ def health_check() -> dict[str, Any]:
         "ok": True,
         "server": "ai-gateway-mvp",
         "version": SERVER_VERSION,
-        "tools": ["health_check", "oem_api_login", "fetch_data_from_oem", "execute_omr_sql", "run_skill"],
+        "tools": [
+            "health_check",
+            "oem_api_login",
+            "fetch_data_from_oem",
+            "execute_omr_sql",
+            "execute_skill_omr_sql",
+            "run_skill",
+            "list_skills",
+            "reload_skills",
+        ],
         "config": {
             "data_source_mode": config.data_source_mode,
             "default_base_url": config.default_base_url,
             "verify_ssl": config.verify_ssl,
         },
+        "log_file": str(MCP_LOG_PATH),
+        "run_skill_note": (
+            "run_skill 多轮 LLM，总耗时常超过 60s。VS Code 扩展：设置 alertMcp.mcp.requestTimeoutMs（默认已 180000）"
+            "并重连 MCP；详见扩展 McpClientService.callTool 的 timeout 参数。"
+        ),
         "message": f"服务在线，数据源模式: {config.data_source_mode}。"
                    f"{'omr_db 模式下 run_skill 无需 OEM 登录，直接传 question 即可。' if config.data_source_mode == 'omr_db' else ''}",
     }

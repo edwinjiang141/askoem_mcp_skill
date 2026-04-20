@@ -89,6 +89,24 @@ class TestNl2SqlEngine(unittest.TestCase):
         self.assertIsNotNone(plan)
         self.assertIn("from sysman.mgmt$metric_current", plan.sql.lower())
 
+    def test_skill_sql_allows_non_mgmt_views(self):
+        sql = "SELECT inst_id, sid FROM gv$session WHERE ROWNUM <= 1"
+        safe, reason = self.engine._is_safe_sql(sql)
+        self.assertFalse(safe)
+        self.assertIn("允许的视图", reason or "")
+        ok, _ = self.engine._is_safe_sql_for_skill(sql)
+        self.assertTrue(ok)
+
+    def test_skill_sql_allows_semicolon_separated_readonly(self):
+        sql = (
+            "SELECT 1 AS a FROM dual; "
+            "SELECT 2 AS b FROM dual"
+        )
+        ok, reason = self.engine._is_safe_sql_for_skill(sql)
+        self.assertTrue(ok, reason)
+        parts = self.engine._split_skill_sql_statements(sql)
+        self.assertEqual(len(parts), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

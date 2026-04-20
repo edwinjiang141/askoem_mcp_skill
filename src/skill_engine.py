@@ -18,14 +18,28 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import yaml
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
-load_dotenv()
+# 与 cwd 无关：固定从仓库根加载 .env（tests / MCP 子进程 cwd 可能非项目根）
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-SKILLS_DIR = Path("skills")
+
+def resolve_skills_dir() -> Path:
+    """
+    解析 skills 根目录：优先环境变量 ASKOEM_SKILLS_DIR，否则为仓库下 skills/（相对本文件，不依赖进程 cwd）。
+    """
+    env = (os.getenv("ASKOEM_SKILLS_DIR") or "").strip()
+    if env:
+        return Path(env).expanduser().resolve()
+    return (Path(__file__).resolve().parent.parent / "skills").resolve()
+
+
+# 兼容旧引用：默认使用 resolve_skills_dir()
+SKILLS_DIR = resolve_skills_dir()
 
 
 # ---------------------------------------------------------------------------
@@ -54,12 +68,17 @@ class SkillRegistry:
     - skills/<name>.skill（单文件形式）
     """
 
-    def __init__(self, skills_dir: Path = SKILLS_DIR):
-        self.skills_dir = skills_dir
+    def __init__(self, skills_dir: Path | None = None):
+        self.skills_dir = skills_dir or resolve_skills_dir()
         self.skills: Dict[str, SkillMetadata] = {}
         self._load_all()
 
     # -- 对外接口 --
+
+    def reload(self) -> None:
+        """重新扫描磁盘上的 SKILL.md（热加载新 skill 时用）。"""
+        self.skills.clear()
+        self._load_all()
 
     def get_skill(self, name: str) -> Optional[SkillMetadata]:
         return self.skills.get(name)
@@ -91,17 +110,23 @@ class SkillRegistry:
 
     @staticmethod
     def _load_references(skill_dir: Path) -> Dict[str, str]:
-        """加载 skill_dir/references/ 下所有 .md 文件内容，返回 {文件名: 内容}。"""
-        refs_dir = skill_dir / "references"
-        if not refs_dir.is_dir():
-            return {}
+        """加载 references/ 下 .md/.txt，以及 skill 根目录 optional 的 reference.md / REFERENCE.md。"""
         result: Dict[str, str] = {}
-        for f in sorted(refs_dir.iterdir()):
-            if f.is_file() and f.suffix in (".md", ".txt"):
+        for name in ("reference.md", "REFERENCE.md"):
+            p = skill_dir / name
+            if p.is_file():
                 try:
-                    result[f.name] = f.read_text(encoding="utf-8")
+                    result[name] = p.read_text(encoding="utf-8")
                 except Exception:
                     pass
+        refs_dir = skill_dir / "references"
+        if refs_dir.is_dir():
+            for f in sorted(refs_dir.iterdir()):
+                if f.is_file() and f.suffix in (".md", ".txt"):
+                    try:
+                        result[f.name] = f.read_text(encoding="utf-8")
+                    except Exception:
+                        pass
         return result
 
     def _parse_and_register(self, file_path: Path):
@@ -114,19 +139,36 @@ class SkillRegistry:
         fm = re.search(r"^---\s*\n(.*?)\n---", content, re.DOTALL)
         if not fm:
             return
-        frontmatter = fm.group(1)
-
-        name_m = re.search(r"name:\s*(.+)", frontmatter)
-        # description 支持单行和多行（>- 折叠格式）
-        desc_m = re.search(r"description:\s*>-?\s*\n(.*?)(?=\n\w|\n---)", frontmatter, re.DOTALL)
-        if not desc_m:
-            desc_m = re.search(r"description:\s*(.+)", frontmatter)
-
-        if not name_m:
-            return
-
-        name = name_m.group(1).strip()
-        description = desc_m.group(1).strip().replace("\n", " ") if desc_m else ""
+        frontmatter_raw = fm.group(1)
+        name: Optional[str] = None
+        description = ""
+        try:
+            meta = yaml.safe_load(frontmatter_raw)
+            if isinstance(meta, dict):
+                raw_name = meta.get("name")
+                if raw_name is not None:
+                    name = str(raw_name).strip()
+                desc_val = meta.get("description", "")
+                if isinstance(desc_val, str):
+                    description = " ".join(desc_val.split())
+                elif desc_val is not None:
+                    description = str(desc_val).strip()
+        except Exception:
+            meta = None
+        if not name:
+            name_m = re.search(r"name:\s*(.+)", frontmatter_raw)
+            if not name_m:
+                return
+            name = name_m.group(1).strip()
+        if not description:
+            desc_m = re.search(
+                r"description:\s*>-?\s*\n(.*?)(?=\n\w|\Z)", frontmatter_raw, re.DOTALL
+            )
+            if not desc_m:
+                desc_m = re.search(r"description:\s*(.+)", frontmatter_raw)
+            description = (
+                desc_m.group(1).strip().replace("\n", " ") if desc_m else ""
+            )
 
         refs = self._load_references(file_path.parent)
 
@@ -276,13 +318,25 @@ class SkillExecutor:
 # ---------------------------------------------------------------------------
 
 def _create_llm(temperature: float = 0) -> ChatOpenAI:
-    """根据 .env 配置创建 LangChain ChatOpenAI 实例（DeepSeek 兼容）。"""
-    return ChatOpenAI(
-        model=os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
-        api_key=os.getenv("DEEPSEEK_API_KEY"),
-        base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-        temperature=temperature,
-    )
+    """
+    根据 .env 配置创建 LangChain ChatOpenAI 实例（DeepSeek 兼容）。
+
+    可选：ASKOEM_LLM_REQUEST_TIMEOUT_SEC（秒，浮点）——单次对 LLM 的 HTTP 超时；
+    不设则使用库默认。run_skill 工作流有多轮 invoke，总耗时常大于单次超时。
+    """
+    kwargs: dict = {
+        "model": os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
+        "api_key": os.getenv("DEEPSEEK_API_KEY"),
+        "base_url": os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+        "temperature": temperature,
+    }
+    raw = (os.getenv("ASKOEM_LLM_REQUEST_TIMEOUT_SEC") or "").strip()
+    if raw:
+        try:
+            kwargs["request_timeout"] = float(raw)
+        except ValueError:
+            pass
+    return ChatOpenAI(**kwargs)
 
 
 def _is_llm_configured() -> bool:
@@ -296,8 +350,9 @@ class AgentSkillsEngine:
     调用 process() 即可完成「选 Skill → 执行 Skill → 返回结果」全流程。
     """
 
-    def __init__(self, skills_dir: Path = SKILLS_DIR):
-        self.registry = SkillRegistry(skills_dir)
+    def __init__(self, skills_dir: Path | None = None):
+        sd = skills_dir or resolve_skills_dir()
+        self.registry = SkillRegistry(sd)
         if _is_llm_configured():
             router_llm = _create_llm(temperature=0)
             executor_llm = _create_llm(temperature=0.7)
@@ -308,6 +363,10 @@ class AgentSkillsEngine:
             self.router = None  # type: ignore[assignment]
             self.executor = None  # type: ignore[assignment]
             self.enabled = False
+
+    def reload_registry(self) -> None:
+        """重新加载 skills 目录（磁盘上新拷贝的 SKILL.md 可立即生效）。"""
+        self.registry.reload()
 
     def process(
         self,

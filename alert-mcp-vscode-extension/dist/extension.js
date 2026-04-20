@@ -2630,7 +2630,7 @@ var SettingsService = class {
       mcp: {
         serverUrl: config2.get("mcp.serverUrl", "http://127.0.0.1:3000/sse"),
         connectionMode: config2.get("mcp.connectionMode", "auto"),
-        requestTimeoutMs: config2.get("mcp.requestTimeoutMs", 6e4)
+        requestTimeoutMs: config2.get("mcp.requestTimeoutMs", 18e4)
       },
       llm: {
         provider: config2.get("llm.provider", "openai-compatible"),
@@ -19986,6 +19986,8 @@ var McpClientService = class {
   connectedUrl;
   toolsCache = [];
   instructions = "";
+  /** MCP SDK 单次请求默认 60s；须与 settings.mcp.requestTimeoutMs 一致，否则 run_skill 等长任务会先超时。 */
+  toolRequestTimeoutMs = 18e4;
   isConnected() {
     return Boolean(this.client);
   }
@@ -20000,10 +20002,13 @@ var McpClientService = class {
   }
   async connect(settings) {
     await this.disconnect();
+    this.toolRequestTimeoutMs = Math.max(5e3, settings.mcp.requestTimeoutMs);
     const url2 = new URL(settings.mcp.serverUrl);
     const token = await this.secrets.getMcpBearerToken();
     const authProvider = token ? { token: async () => token } : void 0;
-    this.output.appendLine(`[MCP] connecting to ${url2.toString()} mode=${settings.mcp.connectionMode}`);
+    this.output.appendLine(
+      `[MCP] connecting to ${url2.toString()} mode=${settings.mcp.connectionMode} toolTimeoutMs=${this.toolRequestTimeoutMs}`
+    );
     const createClient = () => new Client({
       name: "oem-assistant",
       version: "0.1.0"
@@ -20058,7 +20063,13 @@ var McpClientService = class {
     if (!this.client) {
       throw new Error("MCP client is not connected.");
     }
-    const response = await this.client.callTool({ name, arguments: args });
+    this.output.appendLine(
+      `[MCP] callTool name=${name} timeoutMs=${this.toolRequestTimeoutMs}`
+    );
+    const response = await this.client.callTool(
+      { name, arguments: args },
+      { timeout: this.toolRequestTimeoutMs }
+    );
     const textParts = response.content.map((item) => {
       if (item?.type === "text") {
         return item.text;
@@ -20097,6 +20108,7 @@ ${structured}`);
     this.connectedUrl = void 0;
     this.instructions = "";
     this.toolsCache = [];
+    this.toolRequestTimeoutMs = 18e4;
   }
 };
 
