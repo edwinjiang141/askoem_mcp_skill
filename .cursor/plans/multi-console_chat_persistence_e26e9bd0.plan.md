@@ -47,7 +47,7 @@ isProject: false
 
 - `**ConversationMeta`**：`id`（uuid）、`title`、`updatedAt`（number，ms）。
 - `**ConversationSnapshot`**：`meta` + `messages: ChatMessage[]`。
-- `**ChatMessage**`：至少 `id`、`role: 'user' | 'assistant' | 'info'`、`createdAt`；`user` 存完整用户原文；`assistant` 存**完整** `AssistantResult` 序列化（或等价结构），用于 1:1 还原气泡、可折叠步骤与 tool 结果。
+- `**ChatMessage`**：至少 `id`、`role: 'user' | 'assistant' | 'info'`、`createdAt`；`user` 存完整用户原文；`assistant` 存**完整** `AssistantResult` 序列化（或等价结构），用于 1:1 还原气泡、可折叠步骤与 tool 结果。
 - **存储键**：例如 `oemAssistant.conversations.v1` + 当前 `activeConversationId`（`globalState` 或 `workspaceState`，由设置决定）。
 
 ### 持久化策略：不截断（强制）
